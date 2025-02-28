@@ -105,10 +105,9 @@ clang-format: .clang-format
 
 .PHONY: sign
 # try to read the default certificate/key from the dkms config
-dkms_framework=/etc/dkms/framework.conf
--include $(dkms_framework)
-KBUILD_SIGN_KEY=$(mok_signing_key)
-KBUILD_SIGN_CERT=$(mok_certificate)
+dkms_framework=/etc/dkms/framework.conf /etc/dkms/framework.conf.d/*.conf
+KBUILD_SIGN_KEY=$(patsubst mok_signing_key=%,%,$(lastword $(shell grep -h -E "^[[:space:]]*mok_signing_key=" $(dkms_framework))))
+KBUILD_SIGN_CERT=$(patsubst mok_certificate=%,%,$(lastword $(shell grep -h -E "^[[:space:]]*mok_certificate=" $(dkms_framework))))
 
 ifeq ($(KBUILD_SIGN_PIN),)
 define usage_kbuildsignpin
