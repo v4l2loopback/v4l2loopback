@@ -1,5 +1,13 @@
 v4l2loopback-0.13.2
 
+  * V4L2 UAPI compliance in format negotation and stream activation
+  * Fix FIFO management
+  * Fix poll()
+
+ -- IOhannes m zmölnig (Debian/GNU) <umlaeute@debian.org>  Fri, 28 Feb 2025 09:48:06 +0100
+
+v4l2loopback-0.13.2
+
   * Fix compilation on 32bit architectures (i386, armhf,...)
 
  -- IOhannes m zmölnig (Debian/GNU) <umlaeute@debian.org>  Fri, 24 May 2024 11:30:51 +0200

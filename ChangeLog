@@ -1,3 +1,60 @@
+v4l2loopback (0.14.0) unstable; urgency=medium
+
+  [ IOhannes m zmölnig ]
+  * Fix automatic retrieval of signing keys from DKMS>=3.0.4
+  * Document building for a different kernel
+  * Minor code cleanups
+  * GitHub
+    + Improve github-issue template
+    + Exclude old Ubuntu LTS releases that cannot be used in GH actions
+
+  [ MrGamy ]
+  * Update README.md
+
+  [ stephematician ]
+  * Refactor poll()
+    + Fixes poll() for readers failing if first call has readable state
+    + Tidy up some whitespace
+  * Fix FIFO management
+  * V4L2 UAPI compliance in format negotation and stream activation
+    + Safer list access in DQBUF
+    + Add guard to list ops in REQBUFS
+    + Simplify close and free
+    + Fix v4l2-compliance result for button ctrl
+    + Fix default configuration of exclusive_caps
+    + Set valid pix format in add()
+    + Enforce limits on time-per-frame
+    + Enumerate all formats except when fixed
+    + Add resize outbufs_list helper function
+    + Add file-io initialisation function
+    + Use STREAMOFF in REQBUFS when count is zero
+    + Use REQBUFS to free buffers in close()
+    + Add function to check buffer-set capability
+    + Consolidate S_FMT across reader and writer
+    + Set "I/O method" on first read/write or REQBUF
+    + Remove timeout allocate from allocate_buffers
+    + Add mutex for format and buffer changes
+    + QBUF/DQBUF ensure buffer type is MMAP
+    + QBUF/DQBUF set flags when using timeout I/O
+    + QUERYBUF guess capture buffer flags
+    + QUERYBUF set timestamp if buffer dequeued
+    + DQBUF/STREAMON fail if opener has not alloc'd
+    + Use u32 type for buffer counts
+    + Refactor control of logical streams
+    + Set unique timestamp flags
+  * v4l2loopback-ctl: Fix for block when use set-timeout-image verb
+    + Update README accordingly
+  * Do not discard return value of vm_alloc_page
+  * Use atomic operations to count vm_open/close
+  * Simplify loop preparation cases in  mmap()
+  * Code cleanup
+    + Reorder code
+    + Use macros
+    + Remove unreachable/unused code
+    + Tidy up debugging printout
+
+ -- IOhannes m zmölnig (Debian/GNU) <umlaeute@debian.org>  Fri, 28 Feb 2025 09:48:06 +0100
+
 v4l2loopback (0.13.2) unstable; urgency=medium
 
   * Fix compilation on 32bit architectures (i386, armhf,...)
