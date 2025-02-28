@@ -21,11 +21,13 @@ jobs:
         # the following does:
         # - fetch all available tags for the "buildpack-deps" Docker image
         # - fetch all available Ubuntu and Debian releases (that are still hosted on the distros' archive servers)
+        # -   Debian releases are actually hardcoded to their suite names
         # - get the intersection of the tags and the releases
-        # - drop some releases (e.g. 'oldstable')
+        # - drop some blacklisted releases (e.g. 'bionic', 'xenial')
         # - format as a JSON array
         run: |
-          echo matrix=$(true; (curl -s "https://hub.docker.com/v2/repositories/library/buildpack-deps/tags?page_size=1000" | jq -r '.results[] | .name' | sort -u; for url in http://archive.ubuntu.com/ubuntu; do curl -s "${url}/dists/" | grep "href=" | sed -e 's|.*a href="||' -e 's|".*||' -e 's|/$||'; done | sort -u; for d in unstable testing stable oldstable; do echo $d; done) | sort | uniq -d | while read x; do echo -n '"'${x}'" '; done | sed -e 's|^ *|[|' -e 's| *$|]|' -e 's|  *|,|g') | tee -a $GITHUB_OUTPUT
+          blacklist="bionic|xenial"
+          echo matrix=$(true; (curl -s "https://hub.docker.com/v2/repositories/library/buildpack-deps/tags?page_size=1000" | jq -r '.results[] | .name' | sort -u; for url in http://archive.ubuntu.com/ubuntu; do curl -s "${url}/dists/" | grep "href=" | sed -e 's|.*a href="||' -e 's|".*||' -e 's|/$||'; done | sort -u; for d in unstable testing stable oldstable; do echo $d; done) | grep -vE "^(${blacklist})$" | sort | uniq -d | while read x; do echo -n '"'${x}'" '; done | sed -e 's|^ *|[|' -e 's| *$|]|' -e 's|  *|,|g') | tee -a $GITHUB_OUTPUT
         id: set-matrix
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
