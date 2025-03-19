@@ -77,6 +77,14 @@ struct v4l2_loopback_config {
 	int announce_all_caps;
 };
 
+#define V4L2LOOPBACK_CTL_IOCTLMAGIC '~'
+
+/* a pointer to an (unsigned int) that - on success - will hold
+ * the version code of the v4l2loopback module
+ * as returned by KERNEL_VERSION(MAJOR, MINOR, BUGFIX)
+ */
+#define V4L2LOOPBACK_CTL_VERSION _IOR(V4L2LOOPBACK_CTL_IOCTLMAGIC, 0, __u32)
+
 /* a pointer to a (struct v4l2_loopback_config) that has all values you wish to impose on the
  * to-be-created device set.
  * if the ptr is NULL, a new device is created with default values at the driver's discretion.

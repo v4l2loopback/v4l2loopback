@@ -2972,6 +2972,7 @@ static long v4l2loopback_control_ioctl(struct file *file, unsigned int cmd,
 	struct v4l2_loopback_config *confptr = &conf;
 	int device_nr, capture_nr, output_nr;
 	int ret;
+	const __u32 version = V4L2LOOPBACK_VERSION_CODE;
 
 	ret = mutex_lock_killable(&v4l2loopback_ctl_mutex);
 	if (ret)
@@ -3056,6 +3057,15 @@ static long v4l2loopback_control_ioctl(struct file *file, unsigned int cmd,
 		conf.debug = debug;
 		MARK();
 		if (copy_to_user((void *)parm, &conf, sizeof(conf))) {
+			ret = -EFAULT;
+			break;
+		}
+		ret = 0;
+		break;
+	case V4L2LOOPBACK_CTL_VERSION:
+		if (!parm)
+			break;
+		if (copy_to_user((void *)parm, &version, sizeof(version))) {
 			ret = -EFAULT;
 			break;
 		}
