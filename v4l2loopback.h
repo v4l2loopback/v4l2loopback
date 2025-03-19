@@ -86,13 +86,13 @@ struct v4l2_loopback_config {
  */
 #define V4L2LOOPBACK_CTL_ADD 0x4C80
 
+/* the device-number (either CAPTURE or OUTPUT) associated with the loopback-device */
+#define V4L2LOOPBACK_CTL_REMOVE 0x4C81
+
 /* a pointer to a (struct v4l2_loopback_config) that has output_nr and/or capture_nr set
  * (the two values must either refer to video-devices associated with the same loopback device
  *  or exactly one of them must be <0
  */
 #define V4L2LOOPBACK_CTL_QUERY 0x4C82
-
-/* the device-number (either CAPTURE or OUTPUT) associated with the loopback-device */
-#define V4L2LOOPBACK_CTL_REMOVE 0x4C81
 
 #endif /* _V4L2LOOPBACK_H */
