@@ -33,6 +33,10 @@
 #include <linux/miscdevice.h>
 #include "v4l2loopback.h"
 
+#define V4L2LOOPBACK_CTL_ADD_legacy 0x4C80
+#define V4L2LOOPBACK_CTL_REMOVE_legacy 0x4C81
+#define V4L2LOOPBACK_CTL_QUERY_legacy 0x4C82
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
 #error This module is not supported on kernels before 4.0.0.
 #endif
@@ -2985,6 +2989,7 @@ static long v4l2loopback_control_ioctl(struct file *file, unsigned int cmd,
 		break;
 		/* add a v4l2loopback device (pair), based on the user-provided specs */
 	case V4L2LOOPBACK_CTL_ADD:
+	case V4L2LOOPBACK_CTL_ADD_legacy:
 		if (parm) {
 			if ((ret = copy_from_user(&conf, (void *)parm,
 						  sizeof(conf))) < 0)
@@ -2997,6 +3002,7 @@ static long v4l2loopback_control_ioctl(struct file *file, unsigned int cmd,
 		break;
 		/* remove a v4l2loopback device (both capture and output) */
 	case V4L2LOOPBACK_CTL_REMOVE:
+	case V4L2LOOPBACK_CTL_REMOVE_legacy:
 		ret = v4l2loopback_lookup((int)parm, &dev);
 		if (ret >= 0 && dev) {
 			ret = -EBUSY;
@@ -3010,6 +3016,7 @@ static long v4l2loopback_control_ioctl(struct file *file, unsigned int cmd,
 		 * this is mostly about limits (which cannot be queried directly with  VIDIOC_G_FMT and friends
 		 */
 	case V4L2LOOPBACK_CTL_QUERY:
+	case V4L2LOOPBACK_CTL_QUERY_legacy:
 		if (!parm)
 			break;
 		if ((ret = copy_from_user(&conf, (void *)parm, sizeof(conf))) <
