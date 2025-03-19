@@ -1551,7 +1551,19 @@ int main(int argc, char **argv)
 			if (len > 0) {
 				if (len < sizeof(buf))
 					buf[len] = 0;
-				printf("v4l2loopback module v%s", buf);
+				printf("v4l2loopback sysfs v%s", buf);
+			}
+			close(fd);
+		}
+		fd = open_controldevice();
+		if (fd >= 0) {
+			__u32 version = 0;
+			if (ioctl(fd, V4L2LOOPBACK_CTL_VERSION, &version) ==
+			    0) {
+				printf("v4l2loopback module v%d.%d.%d\n",
+				       (version >> 16) & 0xff,
+				       (version >> 8) & 0xff,
+				       (version >> 0) & 0xff);
 			}
 		}
 		break;
