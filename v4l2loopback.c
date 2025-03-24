@@ -3003,7 +3003,7 @@ static long v4l2loopback_control_ioctl(struct file *file, unsigned int cmd,
 		/* remove a v4l2loopback device (both capture and output) */
 	case V4L2LOOPBACK_CTL_REMOVE:
 	case V4L2LOOPBACK_CTL_REMOVE_legacy:
-		ret = v4l2loopback_lookup((int)parm, &dev);
+		ret = v4l2loopback_lookup((__u32)parm, &dev);
 		if (ret >= 0 && dev) {
 			ret = -EBUSY;
 			if (dev->open_count.counter > 0)
