@@ -45,6 +45,10 @@
 #define strscpy strlcpy
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 15, 0)
+#define timer_delete_sync del_timer_sync
+#endif
+
 #if defined(timer_setup) && defined(from_timer)
 #define HAVE_TIMER_SETUP
 #endif
@@ -1792,8 +1796,8 @@ static int vidioc_querybuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 static void buffer_written(struct v4l2_loopback_device *dev,
 			   struct v4l2l_buffer *buf)
 {
-	del_timer_sync(&dev->sustain_timer);
-	del_timer_sync(&dev->timeout_timer);
+	timer_delete_sync(&dev->sustain_timer);
+	timer_delete_sync(&dev->timeout_timer);
 
 	spin_lock_bh(&dev->list_lock);
 	list_move_tail(&buf->list_head, &dev->outbufs_list);
@@ -2370,8 +2374,8 @@ static int v4l2_loopback_close(struct file *file)
 	}
 
 	if (atomic_dec_and_test(&dev->open_count)) {
-		del_timer_sync(&dev->sustain_timer);
-		del_timer_sync(&dev->timeout_timer);
+		timer_delete_sync(&dev->sustain_timer);
+		timer_delete_sync(&dev->timeout_timer);
 		if (!dev->keep_format) {
 			mutex_lock(&dev->image_mutex);
 			free_buffers(dev);
