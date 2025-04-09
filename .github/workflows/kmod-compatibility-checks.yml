@@ -121,6 +121,7 @@ jobs:
 
   make_badges:
     if: always()
+    needs: kmod-compile
     runs-on: ubuntu-latest
     steps:
       - name: get artifacts
