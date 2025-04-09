@@ -1,3 +1,4 @@
+---
 name: kmod compatibility checks
 on:
   pull_request:
@@ -51,13 +52,13 @@ jobs:
           apt-get update --quiet;
           apt-get install --yes --no-install-recommends kmod
           apt-get install --yes --no-install-recommends dkms || true
+          apt-get install --yes --no-install-recommends dctrl-tools || true
+          apt-get install --yes --no-install-recommends linux-headers-generic linux-headers || true
+          grep-aptavail -n -s Package  -F Provides -X linux-headers -o -F Provides -X linux-headers-generic \
+                | xargs apt-get install --yes --no-install-recommends || true
           apt-cache search "linux-headers-[0-9.]*-[0-9]*-" | cut -d " " -f1 \
                 | sed -e 's|linux-headers-\([0-9.]*\)-[0-9]*-\(.*\)|\0 \1 \2|' | sort -t- -k3,4 -V -r | sort  -u -k2,3 -V | cut -d " " -f1 \
-                | xargs apt-get install --yes --no-install-recommends
-          apt-cache search "linux-headers-[0-9.]*-" | cut -d " " -f1 \
-                | grep -vE "linux-headers-[0-9.]*-[0-9]*-" \
-                | sed -e 's|linux-headers-\([0-9.]*\)-\(.*\)|\0 \1 \2|' | sort -t- -k3,4 -V -r | sort  -u -k2,3 -V | cut -d " " -f1 \
-                | xargs apt-get install --yes --no-install-recommends
+                | xargs apt-get install --yes --no-install-recommends || true
           failed=""
           succeeded=""
           skipped=""
