@@ -53,7 +53,7 @@ jobs:
           apt-get update --quiet;
           apt-get install --yes --no-install-recommends kmod
           apt-get install --yes --no-install-recommends dkms || true
-          apt-get install --yes --no-install-recommends dctrl-tools || true
+          apt-get install --yes --no-install-recommends lsb-release dctrl-tools || true
           apt-get install --yes --no-install-recommends linux-headers-generic linux-headers || true
           grep-aptavail -n -s Package  -F Provides -X linux-headers -o -F Provides -X linux-headers-generic \
                 | xargs apt-get install --yes --no-install-recommends || true
@@ -92,15 +92,17 @@ jobs:
             make KERNELRELEASE="${kver}" clean || test ${ret} -ne 0
           done
           statefile=${{ matrix.series }}.state
+          osname="$(lsb_release -si)"
+          osrelease="$(lsb_release -sc)"
           rm -rf "${statefile}"
           for k in ${succeeded}; do
-            echo "success ${k}"
+            echo "success ${osname} ${osrelease} ${k}"
           done >> "${statefile}"
           for k in ${skipped}; do
-            echo "skip    ${k}"
+            echo "skip    ${osname} ${osrelease} ${k}"
           done >> "${statefile}"
           for k in ${failed}; do
-            echo "failure ${k}"
+            echo "failure ${osname} ${osrelease} ${k}"
           done >> "${statefile}"
           echo "#### Successful builds for kernels: ${succeeded}";
           if [ "x${skipped}" != "x" ]; then
