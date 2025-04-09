@@ -118,3 +118,15 @@ jobs:
         with:
           name: ${{ matrix.series }}.state
           path: ${{ matrix.series }}.state
+
+  make_badges:
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: get artifacts
+        uses: actions/download-artifact@v4
+      - name: show data
+        shell: bash
+        run: |
+          find .
+          find . -name "*.state" -exec grep . {} +
