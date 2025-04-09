@@ -91,11 +91,11 @@ jobs:
             fi;
             make KERNELRELEASE="${kver}" clean || test ${ret} -ne 0
           done
+          echo "#### Successful builds for kernels: ${succeeded}";
+          if [ "x${skipped}" != "x" ]; then
+            echo "#### Skipped kernels: ${skipped}";
+          fi
           if [ "x${failed}" != "x" ]; then
             echo "#### Failed kernels: ${failed}";
             exit 1
           fi
-          if [ "x${skipped}" != "x" ]; then
-            echo "#### Skipped kernels: ${skipped}";
-          fi
-          echo "#### Successful builds for kernels: ${succeeded}";
