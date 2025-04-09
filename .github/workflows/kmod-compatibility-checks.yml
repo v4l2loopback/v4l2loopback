@@ -91,6 +91,17 @@ jobs:
             fi;
             make KERNELRELEASE="${kver}" clean || test ${ret} -ne 0
           done
+          statefile=${{ matrix.series }}.state
+          rm -rf "${statefile}"
+          for k in ${succeeded}; do
+            echo "success ${k}"
+          done >> "${statefile}"
+          for k in ${skipped}; do
+            echo "skip    ${k}"
+          done >> "${statefile}"
+          for k in ${failed}; do
+            echo "failure ${k}"
+          done >> "${statefile}"
           echo "#### Successful builds for kernels: ${succeeded}";
           if [ "x${skipped}" != "x" ]; then
             echo "#### Skipped kernels: ${skipped}";
@@ -99,3 +110,9 @@ jobs:
             echo "#### Failed kernels: ${failed}";
             exit 1
           fi
+      - name: Publish state
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.series }}.state
+          path: ${{ matrix.series }}.state
