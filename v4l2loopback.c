@@ -45,16 +45,16 @@
 #define strscpy strlcpy
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 15, 0)
-#define timer_delete_sync del_timer_sync
-#endif
-
 #if defined(timer_setup) && defined(from_timer)
 #define HAVE_TIMER_SETUP
 #endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0)
 #define VFL_TYPE_VIDEO VFL_TYPE_GRABBER
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
+#define timer_delete_sync del_timer_sync
 #endif
 
 #define V4L2LOOPBACK_VERSION_CODE                                              \
