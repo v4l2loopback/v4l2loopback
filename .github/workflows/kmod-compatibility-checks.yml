@@ -146,3 +146,4 @@ jobs:
           gist_id: f877d3367ab47ffd2d203b1062c41825
           file_path: badge.svg
           file_type: text
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
