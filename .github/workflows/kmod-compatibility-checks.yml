@@ -91,15 +91,16 @@ jobs:
             fi;
             make KERNELRELEASE="${kver}" clean || test ${ret} -ne 0
           done
-          statefile=${{ matrix.series }}.state
+          statefile=buildstate.txt
           osname="$(lsb_release -si)"
+          osversion="$(lsb_release -sr)"
           osrelease="$(lsb_release -sc)"
           rm -rf "${statefile}"
           for k in ${succeeded}; do
-            echo "success ${osname} ${osrelease} ${k}"
+            echo "success ${osname} ${osversion} ${osrelease} ${k}"
           done >> "${statefile}"
           for k in ${skipped}; do
-            echo "skip    ${osname} ${osrelease} ${k}"
+            echo "skip    ${osname} ${osversion} ${osrelease} ${k}"
           done >> "${statefile}"
           for k in ${failed}; do
             echo "failure ${osname} ${osrelease} ${k}"
