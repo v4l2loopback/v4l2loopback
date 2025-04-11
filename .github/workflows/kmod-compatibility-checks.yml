@@ -27,8 +27,15 @@ jobs:
         # - drop some blacklisted releases (e.g. 'bionic', 'xenial')
         # - format as a JSON array
         run: |
-          blacklist="bionic|xenial"
-          echo matrix=$(true; (curl -s "https://hub.docker.com/v2/repositories/library/buildpack-deps/tags?page_size=1000" | jq -r '.results[] | .name' | sort -u; for url in http://archive.ubuntu.com/ubuntu; do curl -s "${url}/dists/" | grep "href=" | sed -e 's|.*a href="||' -e 's|".*||' -e 's|/$||'; done | sort -u; for d in unstable testing stable oldstable; do echo $d; done) | grep -vE "^(${blacklist})$" | sort | uniq -d | while read x; do echo -n '"'${x}'" '; done | sed -e 's|^ *|[|' -e 's| *$|]|' -e 's|  *|,|g') | tee -a $GITHUB_OUTPUT
+          ubuntu_blacklist="bionic|xenial"
+          # debian (hardcoded)
+          images="unstable testing stable oldstable"
+          # ubuntu (based on availability)
+          images="${images} $((curl -s "https://hub.docker.com/v2/repositories/library/buildpack-deps/tags?page_size=1000" | jq -r '.results[] | .name' | sort -u; curl -s "http://archive.ubuntu.com/ubuntu/dists/" | grep "href=" | sed -e 's|.*a href="||' -e 's|".*||' -e 's|/$||') | sort | uniq -d | grep -vE "^(${ubuntu_blacklist})$")"
+          # prefix with buildpack-deps
+          images="$(for i in ${images}; do echo "buildpack-deps:${i}"; done)"
+
+          echo matrix=$(for i in ${images}; do echo "${i}"; done | jq -Rn '[inputs]') | tee -a ${GITHUB_OUTPUT}
         id: set-matrix
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
@@ -40,7 +47,7 @@ jobs:
       matrix:
         series: ${{ fromJson(needs.get_debuntu_releases.outputs.matrix) }}
       fail-fast: false
-    container: buildpack-deps:${{ matrix.series }}
+    container: ${{ matrix.series }}
     env:
       JOB_KNOWN_FAILURES: "3.13 3.16 3.19 4.2"
     steps:
