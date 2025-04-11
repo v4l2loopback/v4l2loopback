@@ -97,13 +97,13 @@ jobs:
           osrelease="$(lsb_release -sc)"
           rm -rf "${statefile}"
           for k in ${succeeded}; do
-            echo "success ${osname} ${osversion} ${osrelease} ${k}"
+            echo "${osname} ${osversion} ${osrelease} ${k} success"
           done >> "${statefile}"
           for k in ${skipped}; do
-            echo "skip    ${osname} ${osversion} ${osrelease} ${k}"
+            echo "${osname} ${osversion} ${osrelease} ${k} skip"
           done >> "${statefile}"
           for k in ${failed}; do
-            echo "failure ${osname} ${osrelease} ${k}"
+            echo "${osname} ${osrelease} ${k} failure"
           done >> "${statefile}"
           echo "#### Successful builds for kernels: ${succeeded}";
           if [ "x${skipped}" != "x" ]; then
@@ -130,13 +130,12 @@ jobs:
       - name: create badge
         shell: bash
         run: |
-          find */ -type f -name "buildstate.txt" -exec grep -h . {} + | while read state os version codename kernel; do
-            echo "${os} ${version} ${codename} ${kernel} ${state}"
-          done | sed -e 's|success$|#4C1|' -e 's|skip$|#D3D3D3|' -e 's|failure|#E05D44' > allstates.txt
+          find */ -type f -name "buildstate.txt" -exec grep -h . {} + | sort -u > allstates.txt
           numtests=$(grep -c . allstates.txt)
-          echo '<?xml version="1.0" encoding="UTF-8"?> <svg xmlns="http://www.w3.org/2000/svg" width="323" height="@height@"> <g fill="#fff" text-anchor="left" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" font-size="11"> <linearGradient id="b" x2="0" y2="100%"> <stop offset="0" stop-color="#bbb" stop-opacity=".1"/> <stop offset="1" stop-opacity=".1"/> </linearGradient>' | sed -e "s|@height@|$((numtests * 22))|g" > badge.svg
-          cat -n "$1" | while read num os version kernel color; do
-            echo '<g transform="translate(0 @dy@)" mask="url(#anybadge_1)"> <path fill="#555" d="M0 0h148v20H0z"/> <path fill="@color@" d="M148 0h175v20H148z"/> <path fill="url(#b)" d="M0 0h323v20H0z"/> <text x="9.0" y="15" fill="#010101" fill-opacity=".3">@os@/@version@</text> <text x="8.0" y="14">@os@/@version@</text> <text x="156.5" y="15" fill="#010101" fill-opacity=".3">@kernel@</text> <text x="155.5" y="14">@kernel@</text> </g>' | sed -e "s|@dy@|$((22*(num-1)))|g" -e "s|@color@|${color}|g" -e "s|@os@|${os}|g" -e "s|@version@|${version}|g" -e "s|@kernel@|${kernel}|g"
+          echo '<?xml version="1.0" encoding="UTF-8"?> <svg xmlns="http://www.w3.org/2000/svg" width="323" height="@height@">" > badge.svg
+          echo "<style>.success {fill:#4C1} .skip {fill:#D3D3D3} .failure {fill:#E05D44}</style> <g fill="#fff" text-anchor="left" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" font-size="11"> <linearGradient id="b" x2="0" y2="100%"> <stop offset="0" stop-color="#bbb" stop-opacity=".1"/> <stop offset="1" stop-opacity=".1"/> </linearGradient>' | sed -e "s|@height@|$((numtests * 22))|g" > badge.svg
+          cat -n allstates.txt | while read num os _ version kernel state; do
+            echo '<g transform="translate(0 @dy@)" mask="url(#anybadge_1)"> <path fill="#555" d="M0 0h148v20H0z"/> <path class="@state@" d="M148 0h175v20H148z"/> <path fill="url(#b)" d="M0 0h323v20H0z"/> <text x="9.0" y="15" fill="#010101" fill-opacity=".3">@os@/@version@</text> <text x="8.0" y="14">@os@/@version@</text> <text x="156.5" y="15" fill="#010101" fill-opacity=".3">@kernel@</text> <text x="155.5" y="14">@kernel@</text> </g>' | sed -e "s|@dy@|$((22*(num-1)))|g" -e "s|@state@|${state}|g" -e "s|@os@|${os}|g" -e "s|@version@|${version}|g" -e "s|@kernel@|${kernel}|g"
           done >> badge.svg
           echo '</g> </svg>' >> badge.svg
           cat badge.svg
