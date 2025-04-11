@@ -117,8 +117,8 @@ jobs:
         if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.series }}.state
-          path: ${{ matrix.series }}.state
+          name: ${{ matrix.series }}
+          path: buildstate.txt
 
   make_badges:
     if: always()
@@ -131,4 +131,4 @@ jobs:
         shell: bash
         run: |
           find .
-          find . -name "*.state" -exec grep . {} +
+          find . -type f -name "buildstate.txt" -exec grep . {} +
