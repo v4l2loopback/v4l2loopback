@@ -92,6 +92,7 @@ jobs:
           # run the actual builds
           lsb_release -a
           failed=""
+          allow_failed=""
           succeeded=""
           skipped=""
           for kbuild in /lib/modules/*/build; do
@@ -111,7 +112,7 @@ jobs:
               case " ${JOB_KNOWN_FAILURES} " in
               *" ${kver%.*} "*)
                 echo "#### Skipped known failure ${kver}";
-                skipped="${skipped} ${kver}";
+                allow_failed="${allow_failed} ${kver}";
                 ;;
               *)
                 if test -e "${kbuild}/.config" && ! grep -qE "^(CONFIG_VIDEO_DEV|CONFIG_VIDEO_V4L2)=" "${kbuild}/.config"; then
@@ -140,12 +141,18 @@ jobs:
           for k in ${skipped}; do
             echo "${osname} ${osversion} ${osrelease} ${k} skip"
           done >> "${statefile}"
+          for k in ${ignore_failed}; do
+            echo "${osname} ${osversion} ${osrelease} ${k} softfail
+          done >> "${statefile}"
           for k in ${failed}; do
             echo "${osname} ${osversion} ${osrelease} ${k} failure"
           done >> "${statefile}"
           echo "#### Successful builds for kernels: ${succeeded}";
           if [ "x${skipped}" != "x" ]; then
             echo "#### Skipped kernels: ${skipped}";
+          fi
+          if [ "x${allow_failed}" != "x" ]; then
+            echo "#### Skipped failed kernels: ${allow_failed}";
           fi
           if [ "x${failed}" != "x" ]; then
             echo "#### Failed kernels: ${failed}";
@@ -172,7 +179,7 @@ jobs:
           numtests=$(grep -c . allstates.txt)
           echo -n > badge.svg
           echo '<?xml version="1.0" encoding="UTF-8"?> <svg xmlns="http://www.w3.org/2000/svg" width="333" height="@height@">' | sed -e "s|@height@|$((numtests*22))|g">> badge.svg
-          echo '<style>.success {fill:#4C1} .skip {fill:#D3D3D3} .failure {fill:#E05D44}</style> <g fill="#fff" text-anchor="left" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" font-size="11"> <linearGradient id="b" x2="0" y2="100%"> <stop offset="0" stop-color="#bbb" stop-opacity=".1"/> <stop offset="1" stop-opacity=".1"/> </linearGradient>' | sed -e "s|@height@|$((numtests * 22))|g" >> badge.svg
+          echo '<style>.success {fill:#4C1} .skip {fill:#D3D3D3} .softfail {fill:#FE7D37} .failure {fill:#E05D44}</style> <g fill="#fff" text-anchor="left" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" font-size="11"> <linearGradient id="b" x2="0" y2="100%"> <stop offset="0" stop-color="#bbb" stop-opacity=".1"/> <stop offset="1" stop-opacity=".1"/> </linearGradient>' | sed -e "s|@height@|$((numtests * 22))|g" >> badge.svg
           cat -n allstates.txt | while read num os _ version kernel state; do
             echo '<g transform="translate(0 @dy@)" mask="url(#anybadge_1)"> <path fill="#555" d="M0 0h148v20H0z"/> <path class="@state@" d="M148 0h185v20H148z"/> <path fill="url(#b)" d="M0 0h333v20H0z"/> <text x="9.0" y="15" fill="#010101" fill-opacity=".3">@os@/@version@</text> <text x="8.0" y="14">@os@/@version@</text> <text x="156.5" y="15" fill="#010101" fill-opacity=".3">@kernel@</text> <text x="155.5" y="14">@kernel@</text> </g>' | sed -e "s|@dy@|$((22*(num-1)))|g" -e "s|@state@|${state}|g" -e "s|@os@|${os}|g" -e "s|@version@|${version}|g" -e "s|@kernel@|${kernel}|g"
           done >> badge.svg
