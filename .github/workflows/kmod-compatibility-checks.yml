@@ -85,10 +85,10 @@ jobs:
           ${not_alpine} || apk search "linux-*-dev" | grep "^linux" | sed -e 's|-dev-.*|-dev|' | xargs -n1 apk add
 
           # Fedora
-          not_fedora=true; if which dnf >/dev/null; then not_fedora=false; fi
+          not_fedora=true; if dnf --version >/dev/null; then not_fedora=false; fi
           ${not_fedora} || echo "running Fedora or derivative"
-          ${not_fedora} || dnf upgrade --refresh
-          ${not_fedora} || dnf install --setopt=install_weak_deps=False --skip-unavailable -y lsb-release dkms kernel-devel kernel-headers kernel-modules-core
+          ${not_fedora} || dnf upgrade -y --refresh
+          ${not_fedora} || dnf install -y --setopt=install_weak_deps=False --skip-unavailable lsb-release dkms kernel-devel kernel-headers kernel-modules-core
 
           # run the actual builds
           lsb_release -a
