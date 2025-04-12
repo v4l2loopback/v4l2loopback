@@ -55,6 +55,7 @@ jobs:
       - name: Compile against all available kernel header versions
         shell: bash
         run: |
+          echo "name '${{ matrix.name }}' on image '${{ matrix.image }}'"
           not_debian=true; if which apt-get >/dev/null; then not_debian=false; fi
           echo "not Debian: ${not_debian}"
           deb_packages="kmod dkms lsb-release dctrl-tools linux-headers-generic linux-headers"
