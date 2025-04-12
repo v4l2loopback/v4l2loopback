@@ -176,12 +176,15 @@ jobs:
         shell: bash
         run: |
           find */ -type f -name "buildstate.txt" -exec grep -h . {} + | sort -u > allstates.txt
+          cat -n allstates.txt
           numtests=$(grep -c . allstates.txt)
           echo -n > badge.svg
           echo '<?xml version="1.0" encoding="UTF-8"?> <svg xmlns="http://www.w3.org/2000/svg" width="333" height="@height@">' | sed -e "s|@height@|$((numtests*22))|g">> badge.svg
           echo '<style>.success {fill:#4C1} .skip {fill:#D3D3D3} .softfail {fill:#FE7D37} .failure {fill:#E05D44}</style> <g fill="#fff" text-anchor="left" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" font-size="11"> <linearGradient id="b" x2="0" y2="100%"> <stop offset="0" stop-color="#bbb" stop-opacity=".1"/> <stop offset="1" stop-opacity=".1"/> </linearGradient>' | sed -e "s|@height@|$((numtests * 22))|g" >> badge.svg
           cat -n allstates.txt | while read num os _ version kernel state; do
-            echo '<g transform="translate(0 @dy@)" mask="url(#anybadge_1)"> <path fill="#555" d="M0 0h148v20H0z"/> <path class="@state@" d="M148 0h185v20H148z"/> <path fill="url(#b)" d="M0 0h333v20H0z"/> <text x="9.0" y="15" fill="#010101" fill-opacity=".3">@os@/@version@</text> <text x="8.0" y="14">@os@/@version@</text> <text x="156.5" y="15" fill="#010101" fill-opacity=".3">@kernel@</text> <text x="155.5" y="14">@kernel@</text> </g>' | sed -e "s|@dy@|$((22*(num-1)))|g" -e "s|@state@|${state}|g" -e "s|@os@|${os}|g" -e "s|@version@|${version}|g" -e "s|@kernel@|${kernel}|g"
+            dy=$(((num-1)*22))
+            echo "ENTRY ${num} ${os} ${version} :: ${kernel} @ $dy" >&2
+            echo '<g transform="translate(0 @dy@)" mask="url(#anybadge_1)"> <path fill="#555" d="M0 0h148v20H0z"/> <path class="@state@" d="M148 0h185v20H148z"/> <path fill="url(#b)" d="M0 0h333v20H0z"/> <text x="9.0" y="15" fill="#010101" fill-opacity=".3">@os@/@version@</text> <text x="8.0" y="14">@os@/@version@</text> <text x="156.5" y="15" fill="#010101" fill-opacity=".3">@kernel@</text> <text x="155.5" y="14">@kernel@</text> </g>' | sed -e "s|@dy@|${dy}|g" -e "s|@state@|${state}|g" -e "s|@os@|${os}|g" -e "s|@version@|${version}|g" -e "s|@kernel@|${kernel}|g"
           done >> badge.svg
           echo '</g> </svg>' >> badge.svg
           cat badge.svg
