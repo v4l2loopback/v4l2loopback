@@ -92,7 +92,7 @@ jobs:
           # run the actual builds
           lsb_release -a
           failed=""
-          allow_failed=""
+          soft_failed=""
           succeeded=""
           skipped=""
           for kbuild in /lib/modules/*/build; do
@@ -112,7 +112,7 @@ jobs:
               case " ${JOB_KNOWN_FAILURES} " in
               *" ${kver%.*} "*)
                 echo "#### Skipped known failure ${kver}";
-                allow_failed="${allow_failed} ${kver}";
+                soft_failed="${soft_failed} ${kver}";
                 ;;
               *)
                 if test -e "${kbuild}/.config" && ! grep -qE "^(CONFIG_VIDEO_DEV|CONFIG_VIDEO_V4L2)=" "${kbuild}/.config"; then
@@ -141,7 +141,7 @@ jobs:
           for k in ${skipped}; do
             echo "${osname} ${osversion} ${osrelease} ${k} skip"
           done >> "${statefile}"
-          for k in ${ignore_failed}; do
+          for k in ${soft_failed}; do
             echo "${osname} ${osversion} ${osrelease} ${k} softfail"
           done >> "${statefile}"
           for k in ${failed}; do
@@ -151,8 +151,8 @@ jobs:
           if [ "x${skipped}" != "x" ]; then
             echo "#### Skipped kernels: ${skipped}";
           fi
-          if [ "x${allow_failed}" != "x" ]; then
-            echo "#### Skipped failed kernels: ${allow_failed}";
+          if [ "x${soft_failed}" != "x" ]; then
+            echo "#### Skipped failed kernels: ${soft_failed}";
           fi
           if [ "x${failed}" != "x" ]; then
             echo "#### Failed kernels: ${failed}";
