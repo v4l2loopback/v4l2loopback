@@ -29,13 +29,17 @@ jobs:
         run: |
           ubuntu_blacklist="bionic|xenial"
           # debian (hardcoded)
-          images="unstable testing stable oldstable"
+          debimages="unstable testing stable oldstable"
           # ubuntu (based on availability)
-          images="${images} $((curl -s "https://hub.docker.com/v2/repositories/library/buildpack-deps/tags?page_size=1000" | jq -r '.results[] | .name' | sort -u; curl -s "http://archive.ubuntu.com/ubuntu/dists/" | grep "href=" | sed -e 's|.*a href="||' -e 's|".*||' -e 's|/$||') | sort | uniq -d | grep -vE "^(${ubuntu_blacklist})$")"
-          # prefix with buildpack-deps
-          images="$(for i in ${images}; do echo "buildpack-deps:${i}"; done)"
+          debimages="${debimages} $((curl -s "https://hub.docker.com/v2/repositories/library/buildpack-deps/tags?page_size=1000" | jq -r '.results[] | .name' | sort -u; curl -s "http://archive.ubuntu.com/ubuntu/dists/" | grep "href=" | sed -e 's|.*a href="||' -e 's|".*||' -e 's|/$||') | sort | uniq -d | grep -vE "^(${ubuntu_blacklist})$")"
 
-          echo matrix=$(for i in ${images}; do echo "${i#*:} ${i}"; done | jq -Rn '{include: [inputs] | map( split(" ") | { name:.[0], image:.[1] } )}') | tee -a ${GITHUB_OUTPUT}
+          # make images
+          images=""
+          # prefix deb-images with 'buildpack-deps:'
+          images="$(for i in ${debimages}; do echo "${i} buildpack-deps:${i}"; done) ${images}"
+
+          # create a JSON matrix
+          echo matrix=$(echo ${images} | xargs -n2 echo | jq -Rn '{include: [inputs] | map( split(" ") | { name:.[0], image:.[1] } )}') | tee -a ${GITHUB_OUTPUT}
         id: set-matrix
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
