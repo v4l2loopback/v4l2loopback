@@ -35,7 +35,7 @@ jobs:
           # prefix with buildpack-deps
           images="$(for i in ${images}; do echo "buildpack-deps:${i}"; done)"
 
-          echo matrix=$(for i in ${images}; do echo "${i}"; done | jq -Rn '[inputs]') | tee -a ${GITHUB_OUTPUT}
+          echo matrix=$(for i in ${images}; do echo "${i} ${i#*:}"; done | jq -Rn '[inputs] | map( split(" ") | { name:.[0], image:.[1] } )') | tee -a ${GITHUB_OUTPUT}
         id: set-matrix
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
@@ -44,10 +44,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: get_debuntu_releases
     strategy:
-      matrix:
-        series: ${{ fromJson(needs.get_debuntu_releases.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.get_debuntu_releases.outputs.matrix) }}
       fail-fast: false
-    container: ${{ matrix.series }}
+    container: ${{ matrix.image }}
     env:
       JOB_KNOWN_FAILURES: "3.13 3.16 3.19 4.2"
     steps:
@@ -124,7 +123,7 @@ jobs:
         if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.series }}
+          name: ${{ matrix.name }}
           path: buildstate.txt
 
   make_badges:
