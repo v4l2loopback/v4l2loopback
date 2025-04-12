@@ -35,7 +35,7 @@ jobs:
           # prefix with buildpack-deps
           images="$(for i in ${images}; do echo "buildpack-deps:${i}"; done)"
 
-          echo matrix=$(for i in ${images}; do echo "${i} ${i#*:}"; done | jq -Rn '{includes: [inputs] | map( split(" ") | { name:.[0], image:.[1] } )}') | tee -a ${GITHUB_OUTPUT}
+          echo matrix=$(for i in ${images}; do echo "${i} ${i#*:}"; done | jq -Rn '{include: [inputs] | map( split(" ") | { name:.[0], image:.[1] } )}') | tee -a ${GITHUB_OUTPUT}
         id: set-matrix
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
