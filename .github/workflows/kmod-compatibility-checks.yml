@@ -86,7 +86,7 @@ jobs:
           # Alpine
           not_alpine=true; if which apk >/dev/null; then not_alpine=false; fi
           ${not_alpine} || echo "running Alpine or derivative"
-          ${not_alpine} || apk add lsb-release build-base linux-firmware-none
+          ${not_alpine} || apk add lsb-release build-base linux-headers linux-firmware-none
           ${not_alpine} || apk search "linux-*-dev" | grep "^linux" | sed -e 's|-dev-.*|-dev|' | xargs -n1 apk add
 
           # run the actual builds
