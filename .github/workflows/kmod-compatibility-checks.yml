@@ -98,11 +98,14 @@ jobs:
             test -d $kbuild || continue
             kver=${kbuild%/build}
             kver=${kver##*/}
+            echo "=== Preparing ${kver} ===";
+            touch "/lib/modules/${kver}/modules.builtin"
+            depmod ${kver}
             echo "=== Testing ${kver} ===";
             ret=$(make KERNELRELEASE="${kver}" >&2; echo $?);
             if [ ${ret} -eq 0 ]; then
               succeeded="${succeeded} ${kver}"
-              modinfo v4l2loopback.ko;
+              test ! -e /lib/modules/${kver}/modules.dep || modinfo -k ${kver} v4l2loopback.ko;
             else
               case " ${JOB_KNOWN_FAILURES} " in
               *" ${kver%.*} "*)
