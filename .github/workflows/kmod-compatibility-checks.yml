@@ -137,7 +137,7 @@ jobs:
             echo "${osname} ${osversion} ${osrelease} ${k} skip"
           done >> "${statefile}"
           for k in ${failed}; do
-            echo "${osname} ${osrelease} ${k} failure"
+            echo "${osname} ${osversion} ${osrelease} ${k} failure"
           done >> "${statefile}"
           echo "#### Successful builds for kernels: ${succeeded}";
           if [ "x${skipped}" != "x" ]; then
