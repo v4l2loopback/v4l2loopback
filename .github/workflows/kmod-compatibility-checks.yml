@@ -142,7 +142,7 @@ jobs:
             echo "${osname} ${osversion} ${osrelease} ${k} skip"
           done >> "${statefile}"
           for k in ${ignore_failed}; do
-            echo "${osname} ${osversion} ${osrelease} ${k} softfail
+            echo "${osname} ${osversion} ${osrelease} ${k} softfail"
           done >> "${statefile}"
           for k in ${failed}; do
             echo "${osname} ${osversion} ${osrelease} ${k} failure"
