@@ -65,7 +65,7 @@ jobs:
           echo "name '${{ matrix.name }}' on image '${{ matrix.image }}'"
 
           # Debian and derivatives
-          not_debian=true; if which apt-get >/dev/null; then not_debian=false; fi
+          not_debian=true; if which apt-get >/dev/null 2>/dev/null; then not_debian=false; fi
           ${not_debian} || echo "running Debian or derivative"
           deb_packages="kmod dkms lsb-release dctrl-tools linux-headers-generic linux-headers"
           ${not_debian} || apt-get update --quiet
@@ -79,7 +79,7 @@ jobs:
                 | xargs apt-get install --yes --no-install-recommends || true
 
           # Alpine
-          not_alpine=true; if which apk >/dev/null; then not_alpine=false; fi
+          not_alpine=true; if which apk >/dev/null 2>/dev/null; then not_alpine=false; fi
           ${not_alpine} || echo "running Alpine or derivative"
           ${not_alpine} || apk add lsb-release build-base linux-headers linux-firmware-none
           ${not_alpine} || apk search "linux-*-dev" | grep "^linux" | sed -e 's|-dev-.*|-dev|' | xargs -n1 apk add
