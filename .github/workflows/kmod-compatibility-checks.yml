@@ -60,6 +60,8 @@ jobs:
         shell: bash
         run: |
           echo "name '${{ matrix.name }}' on image '${{ matrix.image }}'"
+
+          # Debian and derivatives
           alias not_debian=true; if which apt-get >/dev/null; then alias not_debian=false; fi
           not_debian || echo "running Debian or derivative"
           deb_packages="kmod dkms lsb-release dctrl-tools linux-headers-generic linux-headers"
@@ -72,6 +74,8 @@ jobs:
           not_debian || apt-cache search "linux-headers-[0-9.]*-[0-9]*-" | cut -d " " -f1 \
                 | sed -e 's|linux-headers-\([0-9.]*\)-[0-9]*-\(.*\)|\0 \1 \2|' | sort -t- -k3,4 -V -r | sort  -u -k2,3 -V | cut -d " " -f1 \
                 | xargs apt-get install --yes --no-install-recommends || true
+          # run the actual builds
+          lsb_release -a
           failed=""
           succeeded=""
           skipped=""
@@ -103,10 +107,13 @@ jobs:
             fi;
             make KERNELRELEASE="${kver}" clean || test ${ret} -ne 0
           done
+
+          # record & report the build state
           statefile=buildstate.txt
           osname="$(lsb_release -si)"
           osversion="$(lsb_release -sr)"
           osrelease="$(lsb_release -sc)"
+          test "${osrelease}" != "n/a" || osrelease="${osversion}"
           rm -rf "${statefile}"
           for k in ${succeeded}; do
             echo "${osname} ${osversion} ${osrelease} ${k} success"
