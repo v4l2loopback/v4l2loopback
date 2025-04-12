@@ -74,6 +74,13 @@ jobs:
           not_debian || apt-cache search "linux-headers-[0-9.]*-[0-9]*-" | cut -d " " -f1 \
                 | sed -e 's|linux-headers-\([0-9.]*\)-[0-9]*-\(.*\)|\0 \1 \2|' | sort -t- -k3,4 -V -r | sort  -u -k2,3 -V | cut -d " " -f1 \
                 | xargs apt-get install --yes --no-install-recommends || true
+
+          # Alpine
+          alias not_alpine=true; if which apk >/dev/null; then alias not_alpine=false; fi
+          not_alpine || echo "running Alpine or derivative"
+          not_alpine || apk add lsb-release build-base linux-firmware-none
+          not_alpine || apk search "linux-*-dev" | grep "^linux" | sed -e 's|-dev-.*|-dev|' | xargs -n1 apk add
+
           # run the actual builds
           lsb_release -a
           failed=""
