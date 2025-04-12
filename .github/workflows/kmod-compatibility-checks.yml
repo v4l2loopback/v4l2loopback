@@ -31,7 +31,7 @@ jobs:
           # debian (hardcoded)
           debimages="unstable testing stable oldstable"
           # ubuntu (based on availability)
-          debimages="${debimages} $((curl -s "https://hub.docker.com/v2/repositories/library/buildpack-deps/tags?page_size=1000" | jq -r '.results[] | .name' | sort -u; curl -s "http://archive.ubuntu.com/ubuntu/dists/" | grep "href=" | sed -e 's|.*a href="||' -e 's|".*||' -e 's|/$||') | sort | uniq -d | grep -vE "^(${ubuntu_blacklist})$")"
+          debimages="${debimages} $(true; (curl -s "https://hub.docker.com/v2/repositories/library/buildpack-deps/tags?page_size=1000" | jq -r '.results[] | .name' | sort -u; curl -s "http://archive.ubuntu.com/ubuntu/dists/" | grep "href=" | sed -e 's|.*a href="||' -e 's|".*||' -e 's|/$||') | sort | uniq -d | grep -vE "^(${ubuntu_blacklist})$")"
 
           # generic images
           latestimages=""
