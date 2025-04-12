@@ -33,10 +33,15 @@ jobs:
           # ubuntu (based on availability)
           debimages="${debimages} $((curl -s "https://hub.docker.com/v2/repositories/library/buildpack-deps/tags?page_size=1000" | jq -r '.results[] | .name' | sort -u; curl -s "http://archive.ubuntu.com/ubuntu/dists/" | grep "href=" | sed -e 's|.*a href="||' -e 's|".*||' -e 's|/$||') | sort | uniq -d | grep -vE "^(${ubuntu_blacklist})$")"
 
+          # generic images
+          latestimages="alpine"
+
           # make images
           images=""
           # prefix deb-images with 'buildpack-deps:'
           images="$(for i in ${debimages}; do echo "${i} buildpack-deps:${i}"; done) ${images}"
+          # suffix latest-images with :latest'
+          images="$(for i in ${latestimages}; do echo "${i} ${i}:latest"; done) ${images}"
 
           # create a JSON matrix
           echo matrix=$(echo ${images} | xargs -n2 echo | jq -Rn '{include: [inputs] | map( split(" ") | { name:.[0], image:.[1] } )}') | tee -a ${GITHUB_OUTPUT}
