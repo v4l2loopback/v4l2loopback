@@ -27,8 +27,22 @@ jobs:
         # - drop some blacklisted releases (e.g. 'bionic', 'xenial')
         # - format as a JSON array
         run: |
-          blacklist="bionic|xenial"
-          echo matrix=$(true; (curl -s "https://hub.docker.com/v2/repositories/library/buildpack-deps/tags?page_size=1000" | jq -r '.results[] | .name' | sort -u; for url in http://archive.ubuntu.com/ubuntu; do curl -s "${url}/dists/" | grep "href=" | sed -e 's|.*a href="||' -e 's|".*||' -e 's|/$||'; done | sort -u; for d in unstable testing stable oldstable; do echo $d; done) | grep -vE "^(${blacklist})$" | sort | uniq -d | while read x; do echo -n '"'${x}'" '; done | sed -e 's|^ *|[|' -e 's| *$|]|' -e 's|  *|,|g') | tee -a $GITHUB_OUTPUT
+          ubuntu_blacklist="bionic|xenial"
+          # debian (hardcoded)
+          debimages="unstable testing stable oldstable"
+          # ubuntu (based on availability)
+          debimages="${debimages} $(true; (curl -s "https://hub.docker.com/v2/repositories/library/buildpack-deps/tags?page_size=1000" | jq -r '.results[] | .name' | sort -u; curl -s "http://archive.ubuntu.com/ubuntu/dists/" | grep "href=" | sed -e 's|.*a href="||' -e 's|".*||' -e 's|/$||') | sort | uniq -d | grep -vE "^(${ubuntu_blacklist})$")"
+
+          # make images
+          images=""
+          # prefix deb-images with 'buildpack-deps:'
+          images="$(for i in ${debimages}; do echo "${i} buildpack-deps:${i}"; done) ${images}"
+
+          # more images in name/container pairs
+          images="alpine openebs/alpine-bash fedora fedora ${images}"
+
+          # create a JSON matrix
+          echo matrix=$(echo ${images} | xargs -n2 echo | jq -Rn '{include: [inputs] | map( split(" ") | { name:.[0], image:.[1] } )}') | tee -a ${GITHUB_OUTPUT}
         id: set-matrix
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
@@ -37,10 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: get_debuntu_releases
     strategy:
-      matrix:
-        series: ${{ fromJson(needs.get_debuntu_releases.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.get_debuntu_releases.outputs.matrix) }}
       fail-fast: false
-    container: buildpack-deps:${{ matrix.series }}
+    container: ${{ matrix.image }}
     env:
       JOB_KNOWN_FAILURES: "3.13 3.16 3.19 4.2"
     steps:
@@ -49,33 +62,58 @@ jobs:
       - name: Compile against all available kernel header versions
         shell: bash
         run: |
-          apt-get update --quiet;
-          apt-get install --yes --no-install-recommends kmod
-          apt-get install --yes --no-install-recommends dkms || true
-          apt-get install --yes --no-install-recommends lsb-release dctrl-tools || true
-          apt-get install --yes --no-install-recommends linux-headers-generic linux-headers || true
-          grep-aptavail -n -s Package  -F Provides -X linux-headers -o -F Provides -X linux-headers-generic \
+          echo "name '${{ matrix.name }}' on image '${{ matrix.image }}'"
+
+          # Debian and derivatives
+          not_debian=true; if which apt-get >/dev/null 2>/dev/null; then not_debian=false; fi
+          ${not_debian} || echo "running Debian or derivative"
+          deb_packages="kmod dkms lsb-release dctrl-tools linux-headers-generic linux-headers"
+          ${not_debian} || apt-get update --quiet
+          ${not_debian} || apt-cache show ${deb_packages} \
+                | sed -e '/^Package:/!d' -e 's|^Package:[[:space:]]*||' | sort -u \
                 | xargs apt-get install --yes --no-install-recommends || true
-          apt-cache search "linux-headers-[0-9.]*-[0-9]*-" | cut -d " " -f1 \
+          ${not_debian} || grep-aptavail -n -s Package  -F Provides -X linux-headers -o -F Provides -X linux-headers-generic \
+                | xargs apt-get install --yes --no-install-recommends || true
+          ${not_debian} || apt-cache search "linux-headers-[0-9.]*-[0-9]*-" | cut -d " " -f1 \
                 | sed -e 's|linux-headers-\([0-9.]*\)-[0-9]*-\(.*\)|\0 \1 \2|' | sort -t- -k3,4 -V -r | sort  -u -k2,3 -V | cut -d " " -f1 \
                 | xargs apt-get install --yes --no-install-recommends || true
+
+          # Alpine
+          not_alpine=true; if which apk >/dev/null 2>/dev/null; then not_alpine=false; fi
+          ${not_alpine} || echo "running Alpine or derivative"
+          ${not_alpine} || apk add lsb-release build-base linux-headers linux-firmware-none
+          ${not_alpine} || apk search "linux-*-dev" | grep "^linux" | sed -e 's|-dev-.*|-dev|' | xargs -n1 apk add
+
+          # Fedora
+          not_fedora=true; if dnf --version >/dev/null; then not_fedora=false; fi
+          ${not_fedora} || echo "running Fedora or derivative"
+          ${not_fedora} || dnf upgrade -y --refresh
+          ${not_fedora} || dnf install -y --setopt=install_weak_deps=False --skip-unavailable lsb-release dkms kernel-devel kernel-headers kernel-modules-core
+
+          # run the actual builds
+          lsb_release -a
           failed=""
+          soft_failed=""
           succeeded=""
           skipped=""
           for kbuild in /lib/modules/*/build; do
             test -d $kbuild || continue
             kver=${kbuild%/build}
             kver=${kver##*/}
+            echo "=== Preparing ${kver} ===";
+            touch "/lib/modules/${kver}/modules.builtin"
+            depmod ${kver}
             echo "=== Testing ${kver} ===";
-            ret=$(make KERNELRELEASE="${kver}" >&2; echo $?);
+            ret=$(make KERNELRELEASE="${kver}" >&2; echo $?)
             if [ ${ret} -eq 0 ]; then
               succeeded="${succeeded} ${kver}"
-              modinfo v4l2loopback.ko;
-            else
+              test ! -e /lib/modules/${kver}/modules.dep || ret=$(modinfo -k ${kver} v4l2loopback.ko >&2; echo $?)
+            fi
+            if [ ${ret} -ne 0 ]; then
               case " ${JOB_KNOWN_FAILURES} " in
               *" ${kver%.*} "*)
                 echo "#### Skipped known failure ${kver}";
-                skipped="${skipped} ${kver}";
+                soft_failed="${soft_failed} ${kver}";
                 ;;
               *)
                 if test -e "${kbuild}/.config" && ! grep -qE "^(CONFIG_VIDEO_DEV|CONFIG_VIDEO_V4L2)=" "${kbuild}/.config"; then
@@ -90,10 +128,13 @@ jobs:
             fi;
             make KERNELRELEASE="${kver}" clean || test ${ret} -ne 0
           done
+
+          # record & report the build state
           statefile=buildstate.txt
           osname="$(lsb_release -si)"
           osversion="$(lsb_release -sr)"
           osrelease="$(lsb_release -sc)"
+          test "${osrelease}" != "n/a" || osrelease="${osversion}"
           rm -rf "${statefile}"
           for k in ${succeeded}; do
             echo "${osname} ${osversion} ${osrelease} ${k} success"
@@ -101,12 +142,18 @@ jobs:
           for k in ${skipped}; do
             echo "${osname} ${osversion} ${osrelease} ${k} skip"
           done >> "${statefile}"
+          for k in ${soft_failed}; do
+            echo "${osname} ${osversion} ${osrelease} ${k} softfail"
+          done >> "${statefile}"
           for k in ${failed}; do
-            echo "${osname} ${osrelease} ${k} failure"
+            echo "${osname} ${osversion} ${osrelease} ${k} failure"
           done >> "${statefile}"
           echo "#### Successful builds for kernels: ${succeeded}";
           if [ "x${skipped}" != "x" ]; then
             echo "#### Skipped kernels: ${skipped}";
+          fi
+          if [ "x${soft_failed}" != "x" ]; then
+            echo "#### Skipped failed kernels: ${soft_failed}";
           fi
           if [ "x${failed}" != "x" ]; then
             echo "#### Failed kernels: ${failed}";
@@ -116,7 +163,7 @@ jobs:
         if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.series }}
+          name: ${{ matrix.name }}
           path: buildstate.txt
 
   make_badges:
@@ -130,12 +177,15 @@ jobs:
         shell: bash
         run: |
           find */ -type f -name "buildstate.txt" -exec grep -h . {} + | sort -u > allstates.txt
+          cat -n allstates.txt
           numtests=$(grep -c . allstates.txt)
           echo -n > badge.svg
           echo '<?xml version="1.0" encoding="UTF-8"?> <svg xmlns="http://www.w3.org/2000/svg" width="333" height="@height@">' | sed -e "s|@height@|$((numtests*22))|g">> badge.svg
-          echo '<style>.success {fill:#4C1} .skip {fill:#D3D3D3} .failure {fill:#E05D44}</style> <g fill="#fff" text-anchor="left" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" font-size="11"> <linearGradient id="b" x2="0" y2="100%"> <stop offset="0" stop-color="#bbb" stop-opacity=".1"/> <stop offset="1" stop-opacity=".1"/> </linearGradient>' | sed -e "s|@height@|$((numtests * 22))|g" >> badge.svg
+          echo '<style>.success {fill:#4C1} .skip {fill:#D3D3D3} .softfail {fill:#FE7D37} .failure {fill:#E05D44}</style> <g fill="#fff" text-anchor="left" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" font-size="11"> <linearGradient id="b" x2="0" y2="100%"> <stop offset="0" stop-color="#bbb" stop-opacity=".1"/> <stop offset="1" stop-opacity=".1"/> </linearGradient>' | sed -e "s|@height@|$((numtests * 22))|g" >> badge.svg
           cat -n allstates.txt | while read num os _ version kernel state; do
-            echo '<g transform="translate(0 @dy@)" mask="url(#anybadge_1)"> <path fill="#555" d="M0 0h148v20H0z"/> <path class="@state@" d="M148 0h185v20H148z"/> <path fill="url(#b)" d="M0 0h333v20H0z"/> <text x="9.0" y="15" fill="#010101" fill-opacity=".3">@os@/@version@</text> <text x="8.0" y="14">@os@/@version@</text> <text x="156.5" y="15" fill="#010101" fill-opacity=".3">@kernel@</text> <text x="155.5" y="14">@kernel@</text> </g>' | sed -e "s|@dy@|$((22*(num-1)))|g" -e "s|@state@|${state}|g" -e "s|@os@|${os}|g" -e "s|@version@|${version}|g" -e "s|@kernel@|${kernel}|g"
+            dy=$(((num-1)*22))
+            echo "ENTRY ${num} ${os} ${version} :: ${kernel} @ $dy" >&2
+            echo '<g transform="translate(0 @dy@)" mask="url(#anybadge_1)"> <path fill="#555" d="M0 0h148v20H0z"/> <path class="@state@" d="M148 0h185v20H148z"/> <path fill="url(#b)" d="M0 0h333v20H0z"/> <text x="9.0" y="15" fill="#010101" fill-opacity=".3">@os@/@version@</text> <text x="8.0" y="14">@os@/@version@</text> <text x="156.5" y="15" fill="#010101" fill-opacity=".3">@kernel@</text> <text x="155.5" y="14">@kernel@</text> </g>' | sed -e "s|@dy@|${dy}|g" -e "s|@state@|${state}|g" -e "s|@os@|${os}|g" -e "s|@version@|${version}|g" -e "s|@kernel@|${kernel}|g"
           done >> badge.svg
           echo '</g> </svg>' >> badge.svg
           cat badge.svg
