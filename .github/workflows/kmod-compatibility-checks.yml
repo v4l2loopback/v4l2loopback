@@ -48,8 +48,6 @@ jobs:
           # more images in name/container pairs
           images="alpine openebs/alpine-bash archinux archlinux:base-devel tumbleweed opensuse/tumbleweed ${images}"
 
-          images="alpine openebs/alpine-bash"
-
           # create a JSON matrix
           echo matrix=$(echo ${images} | xargs -n2 echo | jq -Rn '{include: [inputs] | map( split(" ") | { name:.[0], image:.[1] } )}') | tee -a ${GITHUB_OUTPUT}
         id: set-matrix
@@ -224,7 +222,7 @@ jobs:
           echo '</g> </svg>' >> "${badge}"
           cat "${badge}"
       - name: Deploy badge to wiki
-        #if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         env:
           badge: ${{ steps.createbadge.outputs.badge }}
         run: |
