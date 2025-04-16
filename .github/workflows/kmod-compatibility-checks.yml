@@ -195,9 +195,17 @@ jobs:
     needs: kmod-compile
     runs-on: ubuntu-latest
     steps:
-      - name: get status artifacts
+      - name: Checkout WIKI repository
+        uses: actions/checkout@v4
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        with:
+          repository: v4l2loopback/v4l2loopback.wiki.git
+          token: ${{ secrets.PUSH2REPO_TOKEN }}
+      - name: Get status artifacts
         uses: actions/download-artifact@v4
-      - name: create badge
+      - name: Create badge
         shell: bash
         run: |
           badge=build-state.svg
@@ -209,16 +217,14 @@ jobs:
           echo '<style>.success {fill:#4C1} .skip {fill:#D3D3D3} .softfail {fill:#FE7D37} .failure {fill:#E05D44}</style> <g fill="#fff" text-anchor="left" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" font-size="11"> <linearGradient id="b" x2="0" y2="100%"> <stop offset="0" stop-color="#bbb" stop-opacity=".1"/> <stop offset="1" stop-opacity=".1"/> </linearGradient>' | sed -e "s|@height@|$((numtests * 22))|g" >> "${badge}"
           cat -n allstates.txt | while read num os _ version kernel state; do
             dy=$(((num-1)*22))
-            echo "ENTRY ${num} ${os} ${version} :: ${kernel} @ $dy" >&2
             echo '<g transform="translate(0 @dy@)" mask="url(#anybadge_1)"> <path fill="#555" d="M0 0h148v20H0z"/> <path class="@state@" d="M148 0h185v20H148z"/> <path fill="url(#b)" d="M0 0h333v20H0z"/> <text x="9.0" y="15" fill="#010101" fill-opacity=".3">@os@/@version@</text> <text x="8.0" y="14">@os@/@version@</text> <text x="156.5" y="15" fill="#010101" fill-opacity=".3">@kernel@</text> <text x="155.5" y="14">@kernel@</text> </g>' | sed -e "s|@dy@|${dy}|g" -e "s|@state@|${state}|g" -e "s|@os@|${os}|g" -e "s|@version@|${version}|g" -e "s|@kernel@|${kernel}|g"
           done >> "${badge}"
           echo '</g> </svg>' >> "${badge}"
           cat "${badge}"
-      - name: deploy badge
-        uses: exuanbo/actions-deploy-gist@v1
-        with:
-          token: ${{ secrets.GIST_SECRET }}
-          gist_id: f877d3367ab47ffd2d203b1062c41825
-          file_path: badge.svg
-          file_type: text
+      - name: Deploy badge to wiki
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          echo "${badge}"
+          git add "${badge}"
+          git commit -m "update build-state.svg"
+          git push
