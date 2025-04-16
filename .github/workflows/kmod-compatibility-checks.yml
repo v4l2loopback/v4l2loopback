@@ -65,30 +65,31 @@ jobs:
           echo "name '${{ matrix.name }}' on image '${{ matrix.image }}'"
 
           # Debian and derivatives
-          not_debian=true; if which apt-get >/dev/null 2>/dev/null; then not_debian=false; fi
-          ${not_debian} || echo "running Debian or derivative"
+          not_apt=true; if which apt-get >/dev/null 2>/dev/null; then not_apt=false; fi
+          ${not_apt} || echo "running apt-based distribution (Debian and derivatives)"
           deb_packages="kmod dkms lsb-release dctrl-tools linux-headers-generic linux-headers"
-          ${not_debian} || apt-get update --quiet
-          ${not_debian} || apt-cache show ${deb_packages} \
+          ${not_apt} || apt-get update --quiet
+          ${not_apt} || apt-cache show ${deb_packages} \
                 | sed -e '/^Package:/!d' -e 's|^Package:[[:space:]]*||' | sort -u \
                 | xargs apt-get install --yes --no-install-recommends || true
-          ${not_debian} || grep-aptavail -n -s Package  -F Provides -X linux-headers -o -F Provides -X linux-headers-generic \
+          ${not_apt} || grep-aptavail -n -s Package  -F Provides -X linux-headers -o -F Provides -X linux-headers-generic \
                 | xargs apt-get install --yes --no-install-recommends || true
-          ${not_debian} || apt-cache search "linux-headers-[0-9.]*-[0-9]*-" | cut -d " " -f1 \
+          ${not_apt} || apt-cache search "linux-headers-[0-9.]*-[0-9]*-" | cut -d " " -f1 \
                 | sed -e 's|linux-headers-\([0-9.]*\)-[0-9]*-\(.*\)|\0 \1 \2|' | sort -t- -k3,4 -V -r | sort  -u -k2,3 -V | cut -d " " -f1 \
                 | xargs apt-get install --yes --no-install-recommends || true
 
           # Alpine
-          not_alpine=true; if which apk >/dev/null 2>/dev/null; then not_alpine=false; fi
-          ${not_alpine} || echo "running Alpine or derivative"
-          ${not_alpine} || apk add lsb-release build-base linux-headers linux-firmware-none
-          ${not_alpine} || apk search "linux-*-dev" | grep "^linux" | sed -e 's|-dev-.*|-dev|' | xargs -n1 apk add
+          not_apkg=true; if which apk >/dev/null 2>/dev/null; then not_apkg=false; fi
+          ${not_apkg} || echo "running apk-based distribution (Alpine,...)"
+          ${not_apkg} || apk add lsb-release build-base linux-headers linux-firmware-none
+          ${not_apkg} || apk search "linux-*-dev" | grep "^linux" | sed -e 's|-dev-.*|-dev|' | xargs -n1 apk add
 
           # Fedora
-          not_fedora=true; if dnf --version >/dev/null; then not_fedora=false; fi
-          ${not_fedora} || echo "running Fedora or derivative"
-          ${not_fedora} || dnf upgrade -y --refresh
-          ${not_fedora} || dnf install -y --setopt=install_weak_deps=False --skip-unavailable lsb-release dkms kernel-devel kernel-headers kernel-modules-core
+          not_dnf=true; if dnf --version >/dev/null; then not_dnf=false; fi
+          ${not_dnf} || echo "running dnf-based distribution (Fedora,...)"
+          ${not_dnf} || dnf upgrade -y --refresh
+          ${not_dnf} || dnf install -y --setopt=install_weak_deps=False --skip-unavailable lsb-release dkms kernel-devel kernel-headers kernel-modules-core
+
 
           # run the actual builds
           lsb_release -a
