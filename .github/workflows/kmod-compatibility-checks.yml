@@ -85,10 +85,14 @@ jobs:
           ${not_apkg} || apk search "linux-*-dev" | grep "^linux" | sed -e 's|-dev-.*|-dev|' | xargs -n1 apk add
 
           # Fedora
-          not_dnf=true; if dnf --version >/dev/null; then not_dnf=false; fi
-          ${not_dnf} || echo "running dnf-based distribution (Fedora,...)"
+          not_dnf5=true; if dnf5 --version >/dev/null; then not_dnf5=false; fi
+          ${not_dnf5} || echo "running dnf5-based distribution (Fedora>=41,...)"
+          ${not_dnf5} || dnf5 upgrade -y --refresh
+          ${not_dnf5} || dnf5 install -y --setopt=install_weak_deps=False --skip-unavailable lsb-release dkms kernel-devel kernel-headers kernel-modules-core
+          not_dnf=true; if ${not_dnf5} && dnf --version>/dev/null; then not_dnf=false; fi
+          ${not_dnf5} || echo "running dnf5-based distribution (Fedora<41,...)"
           ${not_dnf} || dnf upgrade -y --refresh
-          ${not_dnf} || dnf install -y --setopt=install_weak_deps=False --skip-unavailable lsb-release dkms kernel-devel kernel-headers kernel-modules-core
+          ${not_dnf} || dnf install -y --setopt=install_weak_deps=False lsb-release dkms kernel-devel kernel-headers kernel-modules-core
 
           # openSUSE
           not_zypper=true; if zypper --version >/dev/null; then not_zypper=false; fi
