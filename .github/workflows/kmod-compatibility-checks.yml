@@ -56,9 +56,9 @@ jobs:
 
   kmod-compile:
     runs-on: ubuntu-latest
-    needs: get_debuntu_releases
+    needs: get_distro_releases
     strategy:
-      matrix: ${{ fromJson(needs.get_debuntu_releases.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.get_distro_releases.outputs.matrix) }}
       fail-fast: false
     container: ${{ matrix.image }}
     env:
