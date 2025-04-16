@@ -156,6 +156,7 @@ jobs:
           osversion="$(lsb_release -sr)"
           osrelease="$(lsb_release -sc)"
           test "${osrelease}" != "n/a" || osrelease="${osversion}"
+          test "${osrelease}" != "rolling" || osrelease="$(date +%Y%m%d)"
           rm -rf "${statefile}"
           for k in ${succeeded}; do
             echo "${osname} ${osversion} ${osrelease} ${k} success"
