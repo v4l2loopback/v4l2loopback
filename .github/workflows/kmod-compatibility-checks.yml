@@ -197,9 +197,6 @@ jobs:
     steps:
       - name: Checkout WIKI repository
         uses: actions/checkout@v4
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         with:
           repository: v4l2loopback/v4l2loopback.wiki.git
           token: ${{ secrets.PUSH2REPO_TOKEN }}
@@ -225,6 +222,8 @@ jobs:
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         run: |
           echo "${badge}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "${badge}"
           git commit -m "update build-state.svg"
           git push
