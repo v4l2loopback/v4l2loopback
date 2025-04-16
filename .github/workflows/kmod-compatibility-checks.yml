@@ -201,6 +201,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: v4l2loopback/v4l2loopback.wiki.git
+          ref: master
           token: ${{ secrets.PUSH2REPO_TOKEN }}
       - name: Get status artifacts
         uses: actions/download-artifact@v4
