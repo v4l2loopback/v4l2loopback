@@ -222,7 +222,7 @@ jobs:
           echo '</g> </svg>' >> "${badge}"
           cat "${badge}"
       - name: Deploy badge to wiki
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        #if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         run: |
           echo "${badge}"
           git config user.name "github-actions[bot]"
