@@ -206,9 +206,11 @@ jobs:
       - name: Get status artifacts
         uses: actions/download-artifact@v4
       - name: Create badge
+        id: createbadge
         shell: bash
         run: |
           badge=build-state.svg
+          echo "badge=${badge}" >> ${GITHUB_OUTPUT}
           find */ -type f -name "buildstate.txt" -exec grep -h . {} + | sort -uf > allstates.txt
           cat -n allstates.txt
           numtests=$(grep -c . allstates.txt)
@@ -223,6 +225,8 @@ jobs:
           cat "${badge}"
       - name: Deploy badge to wiki
         #if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          badge: ${{ steps.createbadge.outputs.badge }}
         run: |
           echo "${badge}"
           git config user.name "github-actions[bot]"
