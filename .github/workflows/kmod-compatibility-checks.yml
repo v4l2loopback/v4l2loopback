@@ -100,6 +100,12 @@ jobs:
           ${not_zypper} || zypper update --no-confirm
           ${not_zypper} || zypper --ignore-unknown install --no-confirm --no-recommends dkms lsb-release  kernel-devel
 
+          # Arch
+          not_pacman=true; if pacman --version >/dev/null; then not_pacman=false; fi
+          ${not_pacman} || echo "running pacman-based distribution (ArchLinux,...)"
+          ${not_pacman} || pacman --noconfirm -Suy dkms lsb-release
+          ${not_pacman} || pacman -Si dkms | sed -n '/^Optional/{ s/[^:]*: //;:a;s/:.*//p;n;/^[^ \t]/q;ba;}' | sort -u | xargs pacman -S --noconfirm
+
           # run the actual builds
           lsb_release -a
           failed=""
