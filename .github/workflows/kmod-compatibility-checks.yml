@@ -197,7 +197,7 @@ jobs:
       - name: create badge
         shell: bash
         run: |
-          find */ -type f -name "buildstate.txt" -exec grep -h . {} + | sort -u > allstates.txt
+          find */ -type f -name "buildstate.txt" -exec grep -h . {} + | sort -uf > allstates.txt
           cat -n allstates.txt
           numtests=$(grep -c . allstates.txt)
           echo -n > badge.svg
