@@ -39,7 +39,7 @@ jobs:
           images="$(for i in ${debimages}; do echo "${i} buildpack-deps:${i}"; done) ${images}"
 
           # more images in name/container pairs
-          images="alpine openebs/alpine-bash fedora fedora ${images}"
+          images="alpine openebs/alpine-bash fedora fedora openSUSEleap opensuse/leap openSUSEtumbleweed opensuse/tumbleweed ${images}"
 
           # create a JSON matrix
           echo matrix=$(echo ${images} | xargs -n2 echo | jq -Rn '{include: [inputs] | map( split(" ") | { name:.[0], image:.[1] } )}') | tee -a ${GITHUB_OUTPUT}
@@ -90,6 +90,11 @@ jobs:
           ${not_dnf} || dnf upgrade -y --refresh
           ${not_dnf} || dnf install -y --setopt=install_weak_deps=False --skip-unavailable lsb-release dkms kernel-devel kernel-headers kernel-modules-core
 
+          # openSUSE
+          not_zypper=true; if zypper --version >/dev/null; then not_zypper=false; fi
+          ${not_zypper} || echo "running zypper-based distribution (openSUSE,...)"
+          ${not_zypper} || zypper update --no-confirm
+          ${not_zypper} || zypper --ignore-unknown install --no-confirm --no-recommends dkms lsb-release  kernel-devel
 
           # run the actual builds
           lsb_release -a
