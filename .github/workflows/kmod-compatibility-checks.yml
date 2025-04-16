@@ -9,6 +9,8 @@ on:
     branches:
       - develop
       - main
+  schedule:
+    - cron: '37 5 * * 1'
 
 jobs:
   get_debuntu_releases:
