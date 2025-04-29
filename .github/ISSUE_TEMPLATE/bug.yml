@@ -40,7 +40,6 @@ body:
         Use [Markdown](https://docs.github.com/github/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax) for formatting.
       placeholder: |
         What did you do (step by step)? What did you expect? What happened?
-      render: markdown
     validations:
       required: true
 
@@ -49,7 +48,8 @@ body:
     attributes:
       label: v4l2loopback version
       description: |
-        What is the exact version of v4l2loopback you are using? (e.g. as reported by `sudo dmesg  | grep -i "v4l2loopback driver version"` or `git describe`)
+        What is the exact version of v4l2loopback you are using? (e.g. as reported by `sudo dmesg  | grep -i "v4l2loopback driver version"` or `git describe`).
+        Please do **not** use a generic version like `latest from main` as this will change over time.
       placeholder: |
         e.g. v0.13.1-10-g2014627
     validations:
