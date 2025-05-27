@@ -1,3 +1,26 @@
+v4l2loopback (0.15.0) unstable; urgency=medium
+
+  * Change public ioctl numbers!
+    + But retain compatibility
+  * Add V4L2LOOPBACK_CTL_VERSION ioctl
+  * Only use `timer_delete_sync` compat macro for linux<6.2.0
+  * Added functionality for linux 6.15+
+  * dkms.conf updates
+
+ -- IOhannes m zmölnig (Debian/GNU) <umlaeute@debian.org>  Tue, 27 May 2025 22:46:46 +0200
+
+v4l2loopback (0.14.0) unstable; urgency=medium
+
+  * Refactor poll()
+  * Fix FIFO management
+  * V4L2 UAPI compliance in format negotation and stream activation
+  * Do not discard return value of vm_alloc_page
+  * Use atomic operations to count vm_open/close
+  * Simplify loop preparation cases in  mmap()
+  * Code cleanup
+
+ -- IOhannes m zmölnig (Debian/GNU) <umlaeute@debian.org>  Fri, 28 Feb 2025 09:48:06 +0100
+
 v4l2loopback-0.13.2
 
   * V4L2 UAPI compliance in format negotation and stream activation

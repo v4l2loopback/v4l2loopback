@@ -1,3 +1,28 @@
+v4l2loopback (0.15.0) unstable; urgency=medium
+
+  [ IOhannes m zmölnig ]
+  * change public ioctl numbers!
+  * add V4L2LOOPBACK_CTL_VERSION ioctl
+
+  * use fixed-size types in public API
+  * order ioctl's by value
+  * v4l2loopback-ctl: (also) query the module version via ioctl
+  * [meta] pre-commit config to automatically run clang-format before committing
+  * only use `timer_delete_sync` compat macro for linux<6.2.0
+  * [github] build on ArchLinux, Fedora, openSUSE
+  * [github] Create a badge with all kernels tested in the CI
+  * [github] note on "exact" v4l2loopback version in issue template
+  * README Replace 'Skype' with 'Zoom'
+  * DKMS: dummy 'clean' rule
+
+  [ Theodore Chiu ]
+  * added functionality for linux 6.15+ (#626)
+
+  [ Andreas Beckmann ]
+  * dkms.conf updates
+
+ -- IOhannes m zmölnig (Debian/GNU) <umlaeute@debian.org>  Tue, 27 May 2025 22:46:46 +0200
+
 v4l2loopback (0.14.0) unstable; urgency=medium
 
   [ IOhannes m zmölnig ]
