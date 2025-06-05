@@ -39,6 +39,14 @@ static const struct v4l2l_format formats[] = {
 		.flags = 0,
 	},
 #endif
+#ifdef V4L2_PIX_FMT_XBGR32
+	{
+		.name = "32 bpp BGRX-8-8-8-8",
+		.fourcc = V4L2_PIX_FMT_XBGR32,
+		.depth = 32,
+		.flags = 0,
+	},
+#endif
 #ifdef V4L2_PIX_FMT_RGBA32
 	{
 		.name = "32 bpp RGBA",
