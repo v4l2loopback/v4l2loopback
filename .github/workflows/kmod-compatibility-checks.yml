@@ -135,6 +135,10 @@ jobs:
             fi
             if [ ${ret} -ne 0 ]; then
               case " ${JOB_KNOWN_FAILURES} " in
+              *" ${kver} "*)
+                echo "#### Skipped known failure ${kver}";
+                soft_failed="${soft_failed} ${kver}";
+                ;;
               *" ${kver%.*} "*)
                 echo "#### Skipped known failure ${kver}";
                 soft_failed="${soft_failed} ${kver}";
