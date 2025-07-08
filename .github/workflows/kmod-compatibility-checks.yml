@@ -90,6 +90,7 @@ jobs:
           ${not_apkg} || echo "running apk-based distribution (Alpine,...)"
           ${not_apkg} || apk add lsb-release build-base linux-headers linux-firmware-none
           ${not_apkg} || apk search "linux-*-dev" | grep "^linux" | sed -e 's|-dev-.*|-dev|' | xargs -n1 apk add
+          ${not_apkg} || JOB_KNOWN_FAILURES="${JOB_KNOWN_FAILURES} 6.15.0-0-edge"
 
           # Fedora
           not_dnf5=true; if dnf5 --version >/dev/null; then not_dnf5=false; fi
