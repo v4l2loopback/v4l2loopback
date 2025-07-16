@@ -1,3 +1,16 @@
+v4l2loopback (0.15.1) unstable; urgency=medium
+
+  [ Neil Armstrong ]
+  * Drop from_timer macro usage
+
+  [ Hanspeter Portner ]
+  * Adds support for XBGR32 (XR24)
+
+  [ IOhannes m zmölnig ]
+  * [github] fix failures with the badge-generation
+
+ -- IOhannes m zmölnig (Debian/GNU) <umlaeute@debian.org>  Wed, 16 Jul 2025 15:31:57 +0200
+
 v4l2loopback (0.15.0) unstable; urgency=medium
 
   [ IOhannes m zmölnig ]

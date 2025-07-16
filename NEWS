@@ -1,3 +1,9 @@
+v4l2loopback (0.15.1) unstable; urgency=medium
+
+  * Fix FTBFS with linux 6.16+
+
+ -- IOhannes m zmölnig (Debian/GNU) <umlaeute@debian.org>  Wed, 16 Jul 2025 15:31:57 +0200
+
 v4l2loopback (0.15.0) unstable; urgency=medium
 
   * Change public ioctl numbers!
