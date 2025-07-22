@@ -23,9 +23,9 @@ struct v4l2_loopback_config {
          * setting this to a value<0, will allocate an available one
          * if nr>=0 and the device already exists, the ioctl will EEXIST
          * if output_nr and capture_nr are the same, only a single device will be created
-	 * NOTE: currently split-devices (where output_nr and capture_nr differ)
-	 *   are not implemented yet.
-	 *   until then, requesting different device-IDs will result in EINVAL.
+		 * NOTE: currently split-devices (where output_nr and capture_nr differ)
+		 * are not implemented yet.
+		 * until then, requesting different device-IDs will result in EINVAL.
          *
          * V4L2LOOPBACK_CTL_QUERY:
          * either both output_nr and capture_nr must refer to the same loopback,
@@ -71,10 +71,15 @@ struct v4l2_loopback_config {
          * whether to announce OUTPUT/CAPTURE capabilities exclusively
          * for this device or not
          * (!exclusive_caps)
-	 * NOTE: this is going to be removed once separate output/capture
-	 *       devices are implemented
+		 * NOTE: this is going to be removed once separate output/capture
+		 * devices are implemented
          */
 	__s32 announce_all_caps;
+
+	/**
+		 * Implement Dynamic Buffer
+	*/
+	int dynamic_buffering; /* 0 = disable, 1 = enable */
 };
 
 #define V4L2LOOPBACK_CTL_IOCTLMAGIC '~'
