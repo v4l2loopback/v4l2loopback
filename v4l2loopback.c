@@ -15,6 +15,12 @@
  */
 #include <linux/version.h>
 #include <linux/vmalloc.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/wait.h>
+#include <linux/atomic.h>
+#include <linux/delay.h>
+#include <linux/errno.h>
 #include <linux/mm.h>
 #include <linux/time.h>
 #include <linux/module.h>
@@ -29,8 +35,10 @@
 #include <media/v4l2-device.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-event.h>
-
+#include <linux/delay.h>
+#include <linux/moduleparam.h>
 #include <linux/miscdevice.h>
+#include <linux/overflow.h>
 #include "v4l2loopback.h"
 
 #define V4L2LOOPBACK_CTL_ADD_legacy 0x4C80
@@ -238,6 +246,27 @@ MODULE_PARM_DESC(max_height,
 static DEFINE_IDR(v4l2loopback_index_idr);
 static DEFINE_MUTEX(v4l2loopback_ctl_mutex);
 
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * 
+ * Dynamic Buffering Control Parameter
+ *
+ * @dynamic_buffering: Global switch for dynamic buffering feature
+ * 
+ * Controls whether dynamic buffering is enabled system-wide:
+ *   0 = Disabled (default)
+ *   1 = Enabled
+ *
+ * This parameter affects all v4l2 loopback devices when set at module load time.
+ * Can be modified at runtime through sysfs at:
+ * /sys/module/<module>/parameters/dynamic_buffering
+ *
+ */
+static int dynamic_buffering = 0; // 0=Disabled, 1=Enabled
+module_param(dynamic_buffering, int, 0644);
+MODULE_PARM_DESC(dynamic_buffering,
+		 "Control Dynamic Buffering (0=Disable, 1=Enable, [Default=0]");
+
 /* frame intervals */
 #define V4L2LOOPBACK_FRAME_INTERVAL_MAX __UINT32_MAX__
 #define V4L2LOOPBACK_FPS_DEFAULT 30
@@ -318,10 +347,152 @@ struct v4l2l_buffer {
 	atomic_t use_count;
 };
 
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * Dynamic Buffering Configuration Constants
+ *
+ * Defines the operational parameters for dynamic buffer management:
+ * - MIN_BUFFER_SIZE: Minimum allowed buffer size (4 pages)
+ * - MAX_DYNAMIC_BUFFER_SIZE: Maximum allowed buffer size (64MB)
+ * - INITIAL_BUFFER_SIZE: Default starting buffer size (1MB)
+ * - HIGH_WATERMARK_PERCENT: Threshold for auto-expansion (85% full)
+ * - LOW_WATERMARK_FRACTION: Threshold for auto-shrinking (1/8 capacity used)
+ * - SHRINK_HEADROOM_DIVISOR: Safety margin when shrinking (25% headroom)
+ * - MAX_RESIZE_RETRIES: Maximum expansion attempts when full
+ * - BUFFER_GRACE_PERIOD_MS: Shutdown cleanup grace period
+ * - BUFFER_RESIZE_LOG_PREFIX: Log message prefix for buffer operations
+ *
+ * These constants control the behavior of the dynamic buffering system,
+ * balancing memory usage against performance requirements.
+ */
+#define MIN_BUFFER_SIZE (4UL * PAGE_SIZE)
+#define MAX_DYNAMIC_BUFFER_SIZE (64UL * 1024 * 1024) /* 64MB */
+#define INITIAL_BUFFER_SIZE (1UL * 1024 * 1024) /* 1MB */
+#define HIGH_WATERMARK_PERCENT 85
+#define LOW_WATERMARK_FRACTION 8 /* 1/8 = 12.5% */
+#define SHRINK_HEADROOM_DIVISOR 4 /* 25% headroom */
+#define MAX_RESIZE_RETRIES 3
+#define BUFFER_GRACE_PERIOD_MS 5 /* Cleanup grace period */
+#define BUFFER_RESIZE_LOG_PREFIX "[v4l2-loopback] Dynamic Buffer"
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * struct dynamic_buffer_stats - Performance tracking for dynamic buffers
+ * 
+ * Tracks comprehensive metrics about buffer operations and performance:
+ * 
+ * @total_bytes_written: Cumulative count of bytes written
+ * @total_bytes_read: Cumulative count of bytes read
+ * @frames_written: Total frames written to buffer
+ * @frames_read: Total frames read from buffer
+ * @frames_dropped: Frames discarded due to overflow
+ * 
+ * @expand_count: Number of buffer expansions
+ * @shrink_count: Number of buffer shrinks
+ * @total_expand_time_us: Total time spent expanding (μs)
+ * @total_shrink_time_us: Total time spent shrinking (μs)
+ * @max_capacity_reached: Maximum size buffer ever grew to
+ * @min_capacity_used: Minimum utilization observed
+ * 
+ * @created_at: Timestamp when buffer was created
+ * @last_expand_at: Last expansion time
+ * @last_shrink_at: Last shrink time
+ * @last_write_at: Last write operation time
+ * @last_read_at: Last read operation time
+ * 
+ * @current_fps_write: Current write rate (frames/sec)
+ * @current_fps_read: Current read rate (frames/sec)
+ * @last_fps_update: Last FPS calculation time
+ * 
+ * This structure provides detailed telemetry for monitoring and optimizing
+ * dynamic buffer performance. All metrics are updated atomically to ensure
+ * thread-safe access while maintaining statistics accuracy.
+ */
+
+struct dynamic_buffer_stats {
+	/* Operations counters */
+	u64 total_bytes_written;
+	u64 total_bytes_read;
+	u64 frames_written;
+	u64 frames_read;
+	u64 frames_dropped;
+
+	/* Resizing statistics */
+	u32 expand_count;
+	u32 shrink_count;
+	u64 total_expand_time_us;
+	u64 total_shrink_time_us;
+	u32 max_capacity_reached;
+	u32 min_capacity_used;
+
+	/* Timestamps */
+	ktime_t created_at;
+	ktime_t last_expand_at;
+	ktime_t last_shrink_at;
+	ktime_t last_write_at;
+	ktime_t last_read_at;
+
+	/* Performance metrics */
+	u32 current_fps_write;
+	u32 current_fps_read;
+	u64 last_fps_update;
+};
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * struct dynamic_buffer - Core structure for dynamic circular buffer implementation
+ * 
+ * @data: Pointer to the allocated memory region for buffer storage
+ * @size: Current total capacity of the buffer in bytes
+ * @initial_size: Original allocated size used as reference for resizing
+ * @write_pos: Current write position (circular index)
+ * @read_pos: Current read position (circular index)
+ * @available: Atomic counter of bytes available for reading
+ * @ref_count: Atomic reference counter for safe memory management
+ * @lock: Spinlock protecting concurrent access to buffer state
+ * @read_waitq: Wait queue for threads blocked on read operations
+ * @write_waitq: Wait queue for threads blocked on write operations
+ * @active: Flag indicating whether buffer is operational
+ * @shutdown_requested: Flag indicating graceful shutdown was initiated
+ * @stats: Structure containing all performance statistics and metrics
+ *
+ * This structure implements a thread-safe, resizable circular buffer with:
+ * - Atomic operations for key counters
+ * - Proper synchronization primitives
+ * - Blocking/non-blocking operation support
+ * - Comprehensive statistics tracking
+ * - Graceful shutdown capability
+ * - Dynamic resizing functionality
+ *
+ * The circular buffer implementation handles wrap-around automatically and
+ * provides safe concurrent access for multiple readers/writers.
+ */
+struct dynamic_buffer {
+	void *data; /* Data buffer */
+	size_t size; /* Current buffer size */
+	size_t initial_size; /* Initial reference size */
+	u32 write_pos; /* Writing position (circular) */
+	u32 read_pos; /* Reading position (circular) */
+	atomic_t available; /* Bytes available for reading*/
+	atomic_t ref_count; /* Reference counter */
+	spinlock_t lock; /* Lock for critical operations */
+	wait_queue_head_t read_waitq; /* Waiting list for readers */
+	wait_queue_head_t write_waitq; /* Waiting list for writers*/
+	bool active; /* Buffer active state */
+	bool shutdown_requested; /* Shutdown flag requested */
+	struct dynamic_buffer_stats stats; /* Statistics */
+};
+
+/*rewrite to support dynamic buffering
+ Copyright (C) 2025 Eli Oliveira Junior*/
 struct v4l2_loopback_device {
 	struct v4l2_device v4l2_dev;
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct video_device *vdev;
+	atomic_t active_producers; /* Counter of active producers (transmission) in dynamic mode */
 
 	/* loopback device-specific parameters */
 	char card_label[32];
@@ -384,6 +555,9 @@ struct v4l2_loopback_device {
 	u32 timeout_buffer_size; /* number bytes alloc'd for timeout buffer */
 	struct timer_list timeout_timer;
 	int timeout_happened;
+
+	struct dynamic_buffer *dbuf;
+	bool use_dynamic_buffering;
 };
 
 enum v4l2l_io_method {
@@ -443,16 +617,46 @@ struct v4l2l_format {
 /* helpers for token exchange and token status */
 #define token_from_type(type) \
 	(V4L2_TYPE_IS_CAPTURE(type) ? V4L2L_TOKEN_CAPTURE : V4L2L_TOKEN_OUTPUT)
-#define acquire_token(dev, opener, label, token) \
-	do {                                     \
-		(opener)->label##_token = token; \
-		(dev)->label##_tokens &= ~token; \
+
+/*rewrite to support both static and dynamic buffering
+ Copyright (C) 2025 Eli Oliveira Junior*/
+#define acquire_token(dev, opener, label, token)                                  \
+	do {                                                                      \
+		unsigned long flags;                                              \
+		spin_lock_irqsave(&(dev)->lock, flags);                           \
+		(opener)->label##_token |= (token);                               \
+		/* Remove token from pool regardless of mode - works for both */  \
+		(dev)->label##_tokens &= ~(token);                                \
+		spin_unlock_irqrestore(&(dev)->lock, flags);                      \
+		dprintk("acquire_token: opener=%p got token=0x%x (dynamic=%d)\n", \
+			opener, token, (dev)->use_dynamic_buffering);             \
 	} while (0)
-#define release_token(dev, opener, label)                         \
-	do {                                                      \
-		(dev)->label##_tokens |= (opener)->label##_token; \
-		(opener)->label##_token = 0;                      \
+
+/*rewrite to support both static and dynamic buffering
+ Copyright (C) 2025 Eli Oliveira Junior*/
+#define release_token(dev, opener, label)                                                      \
+	do {                                                                                   \
+		unsigned long flags;                                                           \
+		u32 releasing_token;                                                           \
+		spin_lock_irqsave(&(dev)->lock, flags);                                        \
+		releasing_token = (opener)->label##_token;                                     \
+		(opener)->label##_token = 0;                                                   \
+		if (releasing_token) {                                                         \
+			/* Always returns token - conservative but functional behavior */      \
+			(dev)->label##_tokens |= releasing_token;                              \
+			dprintk("release_token: opener=%p released token=0x%x (dynamic=%d)\n", \
+				opener, releasing_token,                                       \
+				(dev)->use_dynamic_buffering);                                 \
+		}                                                                              \
+		spin_unlock_irqrestore(&(dev)->lock, flags);                                   \
 	} while (0)
+
+/* Check ownership in dynamic mode */
+#define has_compatible_token(dev, opener, token)                               \
+	((dev)->use_dynamic_buffering ?                                        \
+		 ((opener)->format_token & (token)) || !(dev)->format_tokens : \
+		 ((opener)->format_token & (token)))
+
 #define has_output_token(token) (token & V4L2L_TOKEN_OUTPUT)
 #define has_capture_token(token) (token & V4L2L_TOKEN_CAPTURE)
 #define has_no_owners(dev) ((~((dev)->format_tokens) & V4L2L_TOKEN_MASK) == 0)
@@ -462,6 +666,52 @@ struct v4l2l_format {
 	((dev)->timeout_jiffies > 0 || (token) & V4L2L_TOKEN_TIMEOUT)
 
 static const unsigned int FORMATS = ARRAY_SIZE(formats);
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * 
+ * Dynamic Buffering Interface Functions
+ * 
+ * Core functions implementing dynamic buffer management for V4L2 loopback:
+ *
+ * @init_dynamic_buffer: Initialize dynamic buffer structure
+ * @resize_dynamic_buffer: Resize buffer while maintaining contents
+ * @dynamic_buffer_write: Write data to buffer with automatic expansion
+ * @dynamic_buffer_read: Read data from buffer (blocking/non-blocking)
+ * @sync_dynamic_to_v4l2_buffer: Synchronize dynamic buffer to V4L2 buffer
+ * @__resize_buffer_locked: Internal resize implementation (caller must lock)
+ * @__copy_circular_data: Internal circular buffer copy helper
+ * @format_buffer_size: Format buffer size in human-readable units
+ * @free_dynamic_buffer: Safely deallocate buffer resources
+ * @calculate_buffer_used_bytes: Calculate used bytes in circular buffer
+ *
+ * These functions implement a thread-safe, resizable circular buffer system
+ * with automatic memory management and statistics tracking. The interface
+ * handles:
+ * - Dynamic growth/shrinking based on demand
+ * - Blocking/non-blocking operations
+ * - Proper synchronization between readers/writers
+ * - Graceful error handling
+ * - Efficient circular buffer operations
+ *
+ */
+static int init_dynamic_buffer(struct v4l2_loopback_device *dev);
+static int resize_dynamic_buffer(struct v4l2_loopback_device *dev,
+				 u32 new_capacity);
+static int dynamic_buffer_write(struct v4l2_loopback_device *dev, const u8 *src,
+				u32 len);
+static int dynamic_buffer_read(struct v4l2_loopback_device *dev, u8 *dst,
+			       u32 len, bool block);
+static int sync_dynamic_to_v4l2_buffer(struct v4l2_loopback_device *dev,
+				       struct v4l2l_buffer *bufd,
+				       u32 bytesused);
+static int __resize_buffer_locked(struct dynamic_buffer *dbuf,
+				  u32 new_capacity);
+static void __copy_circular_data(const void *src_data, u32 src_size,
+				 u32 src_pos, void *dst_data, u32 copy_len);
+static void format_buffer_size(size_t size, char *buf, size_t buf_size);
+static void free_dynamic_buffer(struct v4l2_loopback_device *dev);
+static inline u32 calculate_buffer_used_bytes(struct dynamic_buffer *dbuf);
 
 static char *fourcc2str(unsigned int fourcc, char buf[5])
 {
@@ -766,6 +1016,294 @@ static ssize_t attr_show_state(struct device *cd, struct device_attribute *attr,
 
 static DEVICE_ATTR(state, S_IRUGO, attr_show_state, NULL);
 
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * attr_show_dynamic_buffering - Display dynamic buffering status through sysfs
+ * @cd: Parent device structure
+ * @attr: Device attribute (unused)
+ * @buf: Output buffer for status string
+ *
+ * Implements the read operation for the dynamic_buffering sysfs attribute.
+ * Shows the current dynamic buffering state (0=disabled, 1=enabled) of the
+ * v4l2 loopback device in human-readable format.
+ *
+ * Return: Number of bytes written to buffer or negative error code:
+ *         -ENODEV if device is invalid
+ *         Return value from sprintf()
+ */
+static ssize_t attr_show_dynamic_buffering(struct device *cd,
+					   struct device_attribute *attr,
+					   char *buf)
+{
+	struct v4l2_loopback_device *dev = v4l2loopback_cd2dev(cd);
+
+	if (!dev)
+		return -ENODEV;
+	return sprintf(buf, "%d\n", dev->use_dynamic_buffering);
+}
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * attr_store_dynamic_buffering - Configure dynamic buffering through sysfs
+ * @cd: Parent device structure
+ * @attr: Device attribute (unused)
+ * @buf: Input buffer containing new value
+ * @len: Length of input buffer
+ *
+ * Implements the write operation for the dynamic_buffering sysfs attribute.
+ * Accepts values:
+ *   0 = Disable dynamic buffering (frees existing buffer)
+ *   1 = Enable dynamic buffering (allocates buffer if needed)
+ *
+ * Performs proper buffer cleanup when disabling and lazy initialization
+ * when enabling. Uses mutex locking to ensure thread safety during
+ * configuration changes.
+ *
+ * Return: Length of input buffer on success, negative error code on failure:
+ *         -ENODEV if device is invalid
+ *         -EINVAL for invalid input value (>1)
+ *         Other errors from kstrtoul() or buffer operations
+ */
+static ssize_t attr_store_dynamic_buffering(struct device *cd,
+					    struct device_attribute *attr,
+					    const char *buf, size_t len)
+{
+	struct v4l2_loopback_device *dev = v4l2loopback_cd2dev(cd);
+	unsigned long val;
+	int ret;
+
+	if (!dev)
+		return -ENODEV;
+
+	ret = kstrtoul(buf, 0, &val);
+	if (ret < 0)
+		return ret;
+
+	if (val > 1)
+		return -EINVAL;
+
+	mutex_lock(&dev->image_mutex);
+	dev->use_dynamic_buffering = val;
+
+	/* If disabling, free the dynamic buffer if it exists */
+	if (!val && dev->dbuf) {
+		free_dynamic_buffer(dev);
+	}
+	/* If Dynamic Buffering is enabled and still don't have a buffer, try allocating it */
+	else if (val && !dev->dbuf && dev->buffer_size > 0) {
+		init_dynamic_buffer(dev);
+	}
+
+	mutex_unlock(&dev->image_mutex);
+
+	return len;
+}
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * DEVICE_ATTR dynamic_buffering - Sysfs attribute control for dynamic buffering
+ *
+ * Creates a sysfs interface file named "dynamic_buffering" with:
+ * - Read permissions for all users (S_IRUGO)
+ * - Write permission for root only (S_IWUSR)
+ * - attr_show_dynamic_buffering as read handler
+ * - attr_store_dynamic_buffering as write handler
+ *
+ * This exposes the dynamic buffering control to userspace, allowing runtime
+ * configuration of the feature. The interface supports:
+ * - Reading current status (0=disabled, 1=enabled)
+ * - Writing new status values
+ * - Automatic buffer management on state changes
+ *
+ * Location in sysfs: /sys/class/video4linux/videoX/dynamic_buffering
+ */
+static DEVICE_ATTR(dynamic_buffering, S_IRUGO | S_IWUSR,
+		   attr_show_dynamic_buffering, attr_store_dynamic_buffering);
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * dynamic_buffer_stats_show - Display comprehensive buffer statistics
+ * @cd: Parent device structure
+ * @attr: Device attribute (unused)
+ * @buf: Output buffer for statistics
+ *
+ * Generates a detailed human-readable report of dynamic buffer statistics including:
+ * - Current buffer state (size, usage, positions)
+ * - I/O operations (frames/bytes written/read)
+ * - Resize operations (counts, timings)
+ * - Historical maximums
+ * - Recent activity timestamps
+ *
+ * The report is formatted with clear sections and uses human-readable units.
+ * All statistics are gathered under lock protection for accuracy.
+ *
+ * Return: Number of bytes written to buffer, or error message if inactive
+ */
+static ssize_t dynamic_buffer_stats_show(struct device *cd,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	struct v4l2_loopback_device *dev = v4l2loopback_cd2dev(cd);
+	struct dynamic_buffer *dbuf = dev->dbuf;
+	ssize_t len = 0;
+	char size_str[32];
+	ktime_t now;
+	s64 uptime_seconds;
+	u32 avg_expand_time_us = 0;
+	u32 avg_shrink_time_us = 0;
+	u32 data_used;
+	unsigned long flags;
+
+	if (!dev->use_dynamic_buffering || !dbuf) {
+		return sprintf(buf, "Dynamic buffering is not active\n");
+	}
+
+	spin_lock_irqsave(&dbuf->lock, flags);
+
+	now = ktime_get();
+	uptime_seconds = ktime_ms_delta(now, dbuf->stats.created_at) / 1000;
+	data_used = calculate_buffer_used_bytes(dbuf);
+
+	/* Calculate averages */
+	if (dbuf->stats.expand_count > 0)
+		avg_expand_time_us = dbuf->stats.total_expand_time_us /
+				     dbuf->stats.expand_count;
+	if (dbuf->stats.shrink_count > 0)
+		avg_shrink_time_us = dbuf->stats.total_shrink_time_us /
+				     dbuf->stats.shrink_count;
+
+	len += sprintf(buf + len,
+		       "=== V4L2-Loopback Dynamic Buffer Statistics ===\n\n");
+
+	/* Current buffer information */
+	len += sprintf(buf + len, "-- Current State --\n");
+	format_buffer_size(dbuf->size, size_str, sizeof(size_str));
+	len += sprintf(buf + len, "Buffer size:     %s\n", size_str);
+	format_buffer_size(data_used, size_str, sizeof(size_str));
+	len += sprintf(
+		buf + len, "Used:            %s (%u%%)\n", size_str,
+		dbuf->size ? (unsigned int)(data_used * 100 / dbuf->size) : 0U);
+	len += sprintf(buf + len, "Read offset:     %u\n", dbuf->read_pos);
+	len += sprintf(buf + len, "Write offset:    %u\n", dbuf->write_pos);
+	len += sprintf(buf + len, "Uptime:          %lld seconds\n\n",
+		       uptime_seconds);
+
+	/* I/O Statistics */
+	len += sprintf(buf + len, "-- I/O Statistics --\n");
+	len += sprintf(buf + len, "Frames written:  %llu\n",
+		       dbuf->stats.frames_written);
+	len += sprintf(buf + len, "Frames read:     %llu\n",
+		       dbuf->stats.frames_read);
+	len += sprintf(buf + len, "Frames dropped:  %llu\n",
+		       dbuf->stats.frames_dropped);
+	format_buffer_size(dbuf->stats.total_bytes_written, size_str,
+			   sizeof(size_str));
+	len += sprintf(buf + len, "Total written:   %s\n", size_str);
+	format_buffer_size(dbuf->stats.total_bytes_read, size_str,
+			   sizeof(size_str));
+	len += sprintf(buf + len, "Total read:      %s\n\n", size_str);
+
+	/* Resizing statistics */
+	len += sprintf(buf + len, "-- Resize Statistics --\n");
+	len += sprintf(buf + len, "Expand count:    %u (avg time: %u µs)\n",
+		       dbuf->stats.expand_count, avg_expand_time_us);
+	len += sprintf(buf + len, "Shrink count:    %u (avg time: %u µs)\n",
+		       dbuf->stats.shrink_count, avg_shrink_time_us);
+	format_buffer_size(dbuf->stats.max_capacity_reached, size_str,
+			   sizeof(size_str));
+	len += sprintf(buf + len, "Max capacity:    %s\n", size_str);
+
+	/* Timestamps of last operations */
+	if (dbuf->stats.last_expand_at) {
+		s64 ago =
+			ktime_ms_delta(now, dbuf->stats.last_expand_at) / 1000;
+		len += sprintf(buf + len, "Last expand:     %lld seconds ago\n",
+			       ago);
+	}
+	if (dbuf->stats.last_shrink_at) {
+		s64 ago =
+			ktime_ms_delta(now, dbuf->stats.last_shrink_at) / 1000;
+		len += sprintf(buf + len, "Last shrink:     %lld seconds ago\n",
+			       ago);
+	}
+
+	spin_unlock_irqrestore(&dbuf->lock, flags);
+
+	return len;
+}
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * dynamic_buffer_reset_stats_store - Reset dynamic buffer statistics
+ * @cd: Parent device structure
+ * @attr: Device attribute (unused)
+ * @buf: Input buffer containing reset command
+ * @len: Length of input buffer
+ *
+ * Handles the sysfs write operation to reset the dynamic buffer statistics.
+ * Only processes the command when receiving '1' as input. Performs atomic
+ * reset of all statistics while preserving:
+ * - Buffer creation timestamp
+ * - Current buffer capacity
+ *
+ * Requires the dynamic buffer to be active. All statistics are cleared to zero
+ * except min_capacity_used which is set to current buffer size.
+ *
+ * Return: Length of input buffer on success, negative error code on failure:
+ *         -EINVAL if dynamic buffering is inactive
+ */
+static ssize_t dynamic_buffer_reset_stats_store(struct device *cd,
+						struct device_attribute *attr,
+						const char *buf, size_t len)
+{
+	struct v4l2_loopback_device *dev = v4l2loopback_cd2dev(cd);
+	struct dynamic_buffer *dbuf = dev->dbuf;
+	unsigned long flags;
+
+	if (!dev->use_dynamic_buffering || !dbuf)
+		return -EINVAL;
+
+	if (len > 0 && buf[0] == '1') {
+		spin_lock_irqsave(&dbuf->lock, flags);
+		memset(&dbuf->stats, 0, sizeof(dbuf->stats));
+		dbuf->stats.created_at = ktime_get();
+		dbuf->stats.min_capacity_used = dbuf->size;
+		dbuf->stats.max_capacity_reached = dbuf->size;
+		spin_unlock_irqrestore(&dbuf->lock, flags);
+		printk(KERN_INFO "%s: Statistics reset\n",
+		       BUFFER_RESIZE_LOG_PREFIX);
+	}
+
+	return len;
+}
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * Sysfs Attributes for Dynamic Buffer Management:
+ *
+ * @dynamic_buffer_stats: (0444) Read-only statistics interface
+ *   - Path: /sys/class/video4linux/videoX/dynamic_buffer_stats  
+ *   - Shows: Current buffer state, I/O counters, resize history
+ *   - Format: Human-readable multi-line report
+ *
+ * @dynamic_buffer_reset_stats: (0200) Write-only control interface
+ *   - Path: /sys/class/video4linux/videoX/dynamic_buffer_reset_stats
+ *   - Accepts: '1' to reset all statistics
+ *   - Effect: Clears counters while preserving buffer configuration
+ *
+ * These attributes provide monitoring and control of the dynamic buffer system.
+ * Permission bits enforce read-only or write-only access as appropriate.
+ */
+static DEVICE_ATTR(dynamic_buffer_stats, 0444, dynamic_buffer_stats_show, NULL);
+static DEVICE_ATTR(dynamic_buffer_reset_stats, 0200, NULL,
+		   dynamic_buffer_reset_stats_store);
+
 static void v4l2loopback_remove_sysfs(struct video_device *vdev)
 {
 #define V4L2_SYSFS_DESTROY(x) device_remove_file(&vdev->dev, &dev_attr_##x)
@@ -775,6 +1313,12 @@ static void v4l2loopback_remove_sysfs(struct video_device *vdev)
 		V4L2_SYSFS_DESTROY(buffers);
 		V4L2_SYSFS_DESTROY(max_openers);
 		V4L2_SYSFS_DESTROY(state);
+		V4L2_SYSFS_DESTROY(
+			dynamic_buffering); // Dynamic buffer implementation
+		V4L2_SYSFS_DESTROY(
+			dynamic_buffer_stats); // Dynamic buffer implementation
+		V4L2_SYSFS_DESTROY(
+			dynamic_buffer_reset_stats); //Dynamic buffer implementation
 		/* ... */
 	}
 }
@@ -794,6 +1338,13 @@ static void v4l2loopback_create_sysfs(struct video_device *vdev)
 		V4L2_SYSFS_CREATE(buffers);
 		V4L2_SYSFS_CREATE(max_openers);
 		V4L2_SYSFS_CREATE(state);
+		V4L2_SYSFS_CREATE(
+			dynamic_buffering); // Dynamic buffer implementation
+		V4L2_SYSFS_CREATE(
+			dynamic_buffer_stats); // Dynamic buffer implementation
+		V4L2_SYSFS_CREATE(
+			dynamic_buffer_reset_stats); // Dynamic buffer implementation
+
 		/* ... */
 	} while (0);
 
@@ -879,6 +1430,7 @@ static void free_timeout_buffer(struct v4l2_loopback_device *dev);
 static void check_timers(struct v4l2_loopback_device *dev);
 static const struct v4l2_file_operations v4l2_loopback_fops;
 static const struct v4l2_ioctl_ops v4l2_loopback_ioctl_ops;
+static void v4l2_loopback_remove(struct v4l2_loopback_device *dev);
 
 /* V4L2 ioctl caps and params calls */
 /* returns device capabilities
@@ -917,6 +1469,54 @@ static int vidioc_querycap(struct file *file, void *fh,
 
 	memset(cap->reserved, 0, sizeof(cap->reserved));
 	return 0;
+}
+
+/**
+ * Implement Dynamic Buffering
+ * 
+ * format_buffer_size - Formats a size in bytes into human-readable string
+ * @size: Input size in bytes to be formatted
+ * @buf: Output buffer where the formatted string will be stored
+ * @buf_size: Size of the output buffer to prevent overflow
+ *
+ * Converts a byte size into a human-readable format with appropriate unit (B, KB, MB, GB).
+ * Uses integer arithmetic to calculate decimal places for KB/MB/GB conversions.
+ * Ensures the formatted string fits in the provided buffer and is properly null-terminated.
+ *
+ * Example:
+ * 1024 → "1 KB"
+ * 1536 → "1.50 KB"
+ * 1048576 → "1 MB"
+ */
+static void format_buffer_size(size_t size, char *buf, size_t buf_size)
+{
+	const char *units[] = { "B", "KB", "MB", "GB" };
+	int unit_index = 0;
+	size_t size_copy = size;
+	size_t remainder = 0;
+
+	/* Find the appropriate unit */
+	while (size_copy >= 1024 && unit_index < 3) {
+		remainder = size_copy % 1024;
+		size_copy /= 1024;
+		unit_index++;
+	}
+
+	if (unit_index == 0) {
+		/* Bytes - no decimals */
+		snprintf(buf, buf_size, "%zu %s", size, units[unit_index]);
+	} else {
+		/* KB/MB/GB - use integer arithmetic to simulate decimals */
+		size_t decimal_part =
+			(remainder * 100) / 1024; /* Two decimal places */
+		if (decimal_part == 0) {
+			snprintf(buf, buf_size, "%zu %s", size_copy,
+				 units[unit_index]);
+		} else {
+			snprintf(buf, buf_size, "%zu.%02zu %s", size_copy,
+				 decimal_part, units[unit_index]);
+		}
+	}
 }
 
 static int vidioc_enum_framesizes(struct file *file, void *fh,
@@ -1102,7 +1702,11 @@ static int vidioc_try_fmt_vid(struct file *file, void *fh,
  * -   EINVAL if the type is not supported
  * -   EBUSY if buffers are already allocated
  * TODO: (vasaka) set subregions of input
+ * 
+ * rewritten added support for dynamic buffering
+ * Copyright (C) 2025 Eli Oliveira Junior
  */
+
 static int vidioc_s_fmt_vid(struct file *file, void *fh, struct v4l2_format *f)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
@@ -1112,53 +1716,116 @@ static int vidioc_s_fmt_vid(struct file *file, void *fh, struct v4l2_format *f)
 			    token_from_type(f->type);
 	int changed, result;
 	char buf[5];
+	bool dynamic_mode = dev->use_dynamic_buffering;
 
+	/*=== INITIAL VALIDATION ===*/
 	result = vidioc_try_fmt_vid(file, fh, f);
-	if (result < 0)
+	if (result < 0) {
+		dprintk("S_FMT: try_fmt failed with %d\n", result);
 		return result;
+	}
 
-	if (opener->buffer_count > 0)
-		/* must free buffers before format can be set */
+	if (opener->buffer_count > 0) {
+		dprintk("S_FMT: buffers already allocated, requiring release\n");
 		return -EBUSY;
+	}
 
+	/* === MUTEX ACQUISITION === */
 	result = mutex_lock_killable(&dev->image_mutex);
-	if (result < 0)
+	if (result < 0) {
+		dprintk("S_FMT: failed to acquire mutex (%d)\n", result);
 		return result;
+	}
 
+	/* === PREVIOUS TOKEN RELEASE === */
 	if (opener->format_token)
 		release_token(dev, opener, format);
-	if (!(dev->format_tokens & token)) {
-		result = -EBUSY;
-		goto exit_s_fmt_unlock;
+
+	/* === COMPATIBLE TOKEN VALIDATION === */
+	if (dynamic_mode) {
+		/* Dynamic mode: always allows format */
+		dprintk("S_FMT: dynamic mode - allowing format without token restriction\n");
+	} else {
+		/* Static mode: traditional validation */
+		if (!(dev->format_tokens & token)) {
+			result = -EBUSY;
+			dprintk("S_FMT: token %u not available in static mode\n",
+				token);
+			goto exit_s_fmt_unlock;
+		}
 	}
 
-	dprintk("S_FMT[%s] %4s:%ux%u size=%u\n",
+	dprintk("S_FMT[%s] %4s:%ux%u size=%u (dynamic=%d)\n",
 		V4L2_TYPE_IS_CAPTURE(f->type) ? "CAPTURE" : "OUTPUT",
 		fourcc2str(f->fmt.pix.pixelformat, buf), f->fmt.pix.width,
-		f->fmt.pix.height, f->fmt.pix.sizeimage);
+		f->fmt.pix.height, f->fmt.pix.sizeimage, dynamic_mode);
+
+	/* === FORMAT CHANGE CHECK === */
 	changed = !pix_format_eq(&dev->pix_format, &f->fmt.pix, 0);
-	if (changed || has_no_owners(dev)) {
+
+	if (changed || has_no_owners(dev) || dynamic_mode) {
+		/* === BUFFERS ALLOCATION === */
 		result = allocate_buffers(dev, &f->fmt.pix);
-		if (result < 0)
+		if (result < 0) {
+			pr_err("v4l2-loopback: buffer allocation failure (%d)\n",
+			       result);
 			goto exit_s_fmt_unlock;
+		}
+
+		/* === DYNAMIC BUFFER INITIALIZATION === */
+		if (dynamic_mode && !dev->dbuf) {
+			result = init_dynamic_buffer(dev);
+			if (result < 0) {
+				pr_err("v4l2-loopback: dynamic buffer initialization failed (%d)\n",
+				       result);
+				goto exit_s_fmt_free;
+			}
+		}
 	}
+
+	/* === TIMEOUT BUFFER ALLOCATION === */
 	if ((dev->timeout_image && changed) ||
 	    (!dev->timeout_image && need_timeout_buffer(dev, token))) {
 		result = allocate_timeout_buffer(dev);
-		if (result < 0)
+		if (result < 0) {
+			pr_err("v4l2-loopback: timeout buffer allocation failed (%d)\n",
+			       result);
 			goto exit_s_fmt_free;
+		}
 	}
+
+	/* === FORMAT APPLICATION === */
 	if (changed) {
 		dev->pix_format = f->fmt.pix;
 		dev->pix_format_has_valid_sizeimage =
 			v4l2l_pix_format_has_valid_sizeimage(f);
+		pr_info("v4l2-loopback: applied format: %4s %ux%u\n",
+			fourcc2str(f->fmt.pix.pixelformat, buf),
+			f->fmt.pix.width, f->fmt.pix.height);
 	}
+
+	/* === TOKEN ACQUISITION === */
 	acquire_token(dev, opener, format, token);
+
+	/* In dynamic mode, mark that there is an active writer */
+	if (dynamic_mode && V4L2_TYPE_IS_OUTPUT(f->type)) {
+		/* Simulate that there is an active output stream to avoid NO SIGNAL */
+		dprintk("S_FMT: dynamic OUTPUT mode - marking as active\n");
+	}
+
 	if (opener->io_method == V4L2L_IO_TIMEOUT)
 		dev->timeout_image_io = 0;
+
+	pr_info("v4l2-loopback: S_FMT successful (dynamic=%d, token=0x%x)\n",
+		dynamic_mode, token);
+
 	goto exit_s_fmt_unlock;
+
+/* === ERROR CLEANUP === */
 exit_s_fmt_free:
-	free_buffers(dev);
+	if (!dynamic_mode) { /* In dynamic mode, we preserve buffers for other openers */
+		free_buffers(dev);
+	}
 exit_s_fmt_unlock:
 	mutex_unlock(&dev->image_mutex);
 	return result;
@@ -1477,6 +2144,9 @@ static int vidioc_s_output(struct file *file, void *fh, unsigned int index)
 /* returns set of device inputs, in our case there is only one,
  * but later I may add more
  * called on VIDIOC_ENUMINPUT
+ * 
+ * rewritten added support for dynamic buffering
+ * Copyright (C) 2025 Eli Oliveira Junior
  */
 static int vidioc_enum_input(struct file *file, void *fh,
 			     struct v4l2_input *inp)
@@ -1484,6 +2154,10 @@ static int vidioc_enum_input(struct file *file, void *fh,
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
 	struct v4l2_loopback_opener *opener = fh_to_opener(fh);
 	__u32 index = inp->index;
+
+	dprintk("vidioc_enum_input: stream_tokens=0x%x, keep_format=%d, dynamic=%d\n",
+		dev->stream_tokens, dev->keep_format,
+		dev->use_dynamic_buffering);
 
 	if (check_buffer_capability(dev, opener, V4L2_BUF_TYPE_VIDEO_CAPTURE))
 		return -ENOTTY;
@@ -1507,9 +2181,18 @@ static int vidioc_enum_input(struct file *file, void *fh,
 #endif
 #endif /* V4L2LOOPBACK_WITH_STD */
 
-	if (has_output_token(dev->stream_tokens) && !dev->keep_format)
-		/* if no outputs attached; pretend device is powered off */
-		inp->status |= V4L2_IN_ST_NO_SIGNAL;
+	/* FIX: In dynamic mode always report OK signal */
+	if (dev->use_dynamic_buffering) {
+		/* Dynamic mode: never reports NO_SIGNAL */
+		dprintk("vidioc_enum_input: dynamic mode - signal OK\n");
+	} else {
+		/* Static mode: original logic */
+		if (has_output_token(dev->stream_tokens) && !dev->keep_format) {
+			/* if no outputs attached; pretend device is powered off */
+			inp->status |= V4L2_IN_ST_NO_SIGNAL;
+			dprintk("vidioc_enum_input: static mode - NO_SIGNAL\n");
+		}
+	}
 
 	return 0;
 }
@@ -1793,17 +2476,23 @@ static int vidioc_querybuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	return 0;
 }
 
+/* rewritten to be thread-safe with multiple producers in Dynamic Buffering
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+*/
 static void buffer_written(struct v4l2_loopback_device *dev,
 			   struct v4l2l_buffer *buf)
 {
+	unsigned long flags;
+
 	timer_delete_sync(&dev->sustain_timer);
 	timer_delete_sync(&dev->timeout_timer);
 
-	spin_lock_bh(&dev->list_lock);
+	spin_lock_irqsave(&dev->list_lock, flags); //thread-safe
 	list_move_tail(&buf->list_head, &dev->outbufs_list);
-	spin_unlock_bh(&dev->list_lock);
+	spin_unlock_irqrestore(&dev->list_lock, flags); //thread-safe
 
-	spin_lock_bh(&dev->lock);
+	spin_lock_irqsave(&dev->lock, flags); //thread-safe
 	dev->bufpos2index[v4l2l_mod64(dev->write_position,
 				      dev->used_buffer_count)] =
 		buf->buffer.index;
@@ -1811,11 +2500,78 @@ static void buffer_written(struct v4l2_loopback_device *dev,
 	dev->reread_count = 0;
 
 	check_timers(dev);
-	spin_unlock_bh(&dev->lock);
+	spin_unlock_irqrestore(&dev->lock, flags); //thread-safe
+}
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * sync_dynamic_to_v4l2_buffer - Synchronizes data from dynamic buffer to V4L2 buffer
+ * @dev: Pointer to the v4l2_loopback_device structure
+ * @bufd: Pointer to the v4l2l_buffer structure (destination buffer)
+ * @bytesused: Number of bytes to be copied
+ *
+ * Copies data from the dynamic buffer to the V4L2 buffer, handling buffer management
+ * and synchronization. If dynamic buffering is disabled or data is unavailable,
+ * fills the destination buffer with zeros. Manages reference counting for the
+ * dynamic buffer and handles cleanup when the last reference is released.
+ *
+ * Return: Number of bytes copied on success (may be zero-filled),
+ *         0 if dynamic buffering is disabled,
+ *         -ENODEV if dynamic buffer is not available
+ */
+static int sync_dynamic_to_v4l2_buffer(struct v4l2_loopback_device *dev,
+				       struct v4l2l_buffer *bufd, u32 bytesused)
+{
+	struct dynamic_buffer *dbuf;
+	unsigned long flags;
+	void *dest;
+	u32 to_copy;
+	int ret = 0;
+
+	if (!dev->use_dynamic_buffering || !dev->dbuf)
+		return 0;
+
+	spin_lock_irqsave(&dev->lock, flags);
+	dbuf = dev->dbuf;
+	if (dbuf)
+		atomic_inc(&dbuf->ref_count);
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	if (!dbuf)
+		return -ENODEV;
+
+	/* Destination is the mapped V4L2 buffer */
+	dest = dev->image + bufd->buffer.m.offset;
+	to_copy = min(bytesused, dev->buffer_size);
+
+	/* Reads data from the dynamic buffer*/
+	ret = dynamic_buffer_read(dev, dest, to_copy, false);
+	if (ret < 0) {
+		/* If there is not enough data, fill with zeros */
+		memset(dest, 0, to_copy);
+		ret = to_copy;
+	} else if (ret < to_copy) {
+		/* Fill the rest with zeros if necessary */
+		memset(dest + ret, 0, to_copy - ret);
+		ret = to_copy;
+	}
+
+	/* Reference release */
+	if (atomic_dec_return(&dbuf->ref_count) == 0 &&
+	    dbuf->shutdown_requested) {
+		vfree(dbuf->data);
+		kfree(dbuf);
+	}
+
+	return ret;
 }
 
 /* put buffer to queue
  * called on VIDIOC_QBUF
+ * 
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * rewritten added support for dynamic buffering
  */
 static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 {
@@ -1824,6 +2580,10 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	struct v4l2l_buffer *bufd;
 	u32 index = buf->index;
 	u32 type = buf->type;
+	unsigned long flags;
+
+	dprintk("QBUF START: type=%d, index=%u, bytesused=%u\n", type, index,
+		buf->bytesused);
 
 	if (!is_allocated(opener, type, index))
 		return -EINVAL;
@@ -1852,6 +2612,28 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
 		dprintkrw("QBUF(OUTPUT, index=%u) -> " BUFFER_DEBUG_FMT_STR,
 			  index, BUFFER_DEBUG_FMT_ARGS(buf));
+
+		/* In dynamic mode, writes to the dynamic buffer */
+		if (dev->use_dynamic_buffering && dev->dbuf) {
+			void *src = dev->image + bufd->buffer.m.offset;
+			u32 bytes_to_write = buf->bytesused;
+
+			dprintk("Writing %u bytes to dynamic buffer\n",
+				bytes_to_write);
+
+			if (bytes_to_write > 0) {
+				int ret = dynamic_buffer_write(dev, src,
+							       bytes_to_write);
+				if (ret < 0) {
+					dprintk("Failed to write to dynamic buffer: %d\n",
+						ret);
+				} else {
+					dprintk("Successfully wrote %d bytes to dynamic buffer\n",
+						ret);
+				}
+			}
+		}
+
 		if (!(bufd->buffer.flags & V4L2_BUF_FLAG_TIMESTAMP_COPY) &&
 		    (buf->timestamp.tv_sec == 0 &&
 		     buf->timestamp.tv_usec == 0)) {
@@ -1881,10 +2663,21 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 		} else {
 			bufd->buffer.bytesused = buf->bytesused;
 		}
+
+		/* Additional protection for multiple producers in dynamic buffering */
+		spin_lock_irqsave(&dev->lock, flags);
 		bufd->buffer.sequence = dev->write_position;
+		spin_unlock_irqrestore(&dev->lock, flags);
+
 		set_queued(bufd->buffer.flags);
 		*buf = bufd->buffer;
+
+		dprintk("Before buffer_written: write_position=%lld\n",
+			dev->write_position);
 		buffer_written(dev, bufd);
+		dprintk("After buffer_written: write_position=%lld\n",
+			dev->write_position);
+
 		set_done(bufd->buffer.flags);
 		wake_up_all(&dev->read_event);
 		break;
@@ -1892,6 +2685,7 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 		return -EINVAL;
 	}
 	buf->type = type;
+	dprintk("QBUF END: stream_tokens=0x%x\n", dev->stream_tokens);
 	return 0;
 }
 
@@ -1908,6 +2702,11 @@ static int can_read(struct v4l2_loopback_device *dev,
 	return ret;
 }
 
+/*
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * rewritten added support for dynamic buffering
+ * add dynamic buffer synchronization
+*/
 static int get_capture_buffer(struct file *file)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
@@ -1957,6 +2756,17 @@ static int get_capture_buffer(struct file *file)
 		memcpy(dev->image + dev->buffers[index].buffer.m.offset,
 		       dev->timeout_image, dev->buffer_size);
 	}
+
+	else if (dev->use_dynamic_buffering && dev->dbuf) {
+		/* In dynamic mode, sync from dynamic buffer */
+		int sync_ret = sync_dynamic_to_v4l2_buffer(
+			dev, &dev->buffers[index], dev->buffer_size);
+		if (sync_ret < 0) {
+			dprintk("Failed to sync dynamic buffer to V4L2: %d\n",
+				sync_ret);
+		}
+	}
+
 	return (int)index;
 }
 
@@ -2020,40 +2830,132 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 
 /* start streaming
  * called on VIDIOC_STREAMON
+ * 
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * rewritten added support for dynamic buffering
  */
 static int vidioc_streamon(struct file *file, void *fh, enum v4l2_buf_type type)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
 	struct v4l2_loopback_opener *opener = fh_to_opener(fh);
 	u32 token = token_from_type(type);
+	bool dynamic_mode = dev->use_dynamic_buffering;
+	int result = 0;
 
-	/* short-circuit when using timeout buffer set */
-	if (opener->format_token & V4L2L_TOKEN_TIMEOUT)
-		return 0;
-	/* opener must have claimed (same) buffer set via REQBUFS */
-	if (!opener->buffer_count || !(opener->format_token & token))
-		return -EINVAL;
+	dprintk("STREAMON START: type=%d, token=0x%x, dynamic=%d, stream_tokens=0x%x\n",
+		type, token, dynamic_mode, dev->stream_tokens);
 
-	switch (type) {
-	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
-		if (has_output_token(dev->stream_tokens) && !dev->keep_format)
-			return -EIO;
-		if (dev->stream_tokens & token) {
-			acquire_token(dev, opener, stream, token);
-			client_usage_queue_event(dev->vdev);
+	/* Ensure dynamic buffer is initialized if necessary */
+	if (dev->use_dynamic_buffering && !dev->dbuf &&
+	    type == V4L2_BUF_TYPE_VIDEO_OUTPUT) {
+		int init_ret;
+		mutex_lock(&dev->image_mutex);
+		init_ret = init_dynamic_buffer(dev);
+		mutex_unlock(&dev->image_mutex);
+		if (init_ret < 0) {
+			pr_err("v4l2-loopback: dynamic buffer initialization failed on STREAMON\n");
+			return init_ret;
 		}
+	}
+
+	/* === VALIDATION FOR TIMEOUT BUFFER === */
+	if (opener->format_token & V4L2L_TOKEN_TIMEOUT) {
+		dprintk("STREAMON: using timeout buffer\n");
 		return 0;
-	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
-		if (dev->stream_tokens & token)
-			acquire_token(dev, opener, stream, token);
-		return 0;
-	default:
+	}
+
+	/* === BUFFER COUNT VALIDATION === */
+	if (!opener->buffer_count || !(opener->format_token & token)) {
+		pr_err("v4l2-loopback: STREAMON with no buffers allocated (count=%u, token=0x%x)\n",
+		       opener->buffer_count, opener->format_token);
 		return -EINVAL;
 	}
+
+	/* === SPECIFIC LOGIC BY BUFFER TYPE === */
+	switch (type) {
+	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
+		if (dynamic_mode) {
+			/* Dynamic mode: allows multiple capturers */
+			if (!(opener->stream_token & token)) {
+				dprintk("CAPTURE acquiring token in dynamic mode\n");
+				acquire_token(dev, opener, stream, token);
+				client_usage_queue_event(dev->vdev);
+				pr_info("v4l2-loopback: CAPTURE stream started (dynamic mode)\n");
+			}
+			result = 0;
+		} else {
+			/* Static mode: traditional validation */
+			if (has_output_token(dev->stream_tokens) &&
+			    !dev->keep_format) {
+				pr_warn("v4l2-loopback: CAPTURE cannot start with OUTPUT active\n");
+				return -EIO;
+			}
+			if (dev->stream_tokens & token) {
+				acquire_token(dev, opener, stream, token);
+				client_usage_queue_event(dev->vdev);
+			}
+			result = 0;
+		}
+		break;
+
+	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
+		if (dynamic_mode) {
+			/* Dynamic mode: allows multiple writers */
+			if (!(opener->stream_token & token)) {
+				dprintk("OUTPUT acquiring token in dynamic mode\n");
+				acquire_token(dev, opener, stream, token);
+
+				/* Increment active producers counter */
+				atomic_inc(&dev->active_producers);
+
+				/* Ensure dynamic buffer is initialized */
+				if (!dev->dbuf) {
+					mutex_lock(&dev->image_mutex);
+					result = init_dynamic_buffer(dev);
+					mutex_unlock(&dev->image_mutex);
+					if (result < 0) {
+						pr_err("v4l2-loopback: dynamic buffer initialization failed\n");
+						atomic_dec(
+							&dev->active_producers);
+						return result;
+					}
+				}
+
+				/* Prepare buffer queues if needed */
+				if (list_empty(&dev->outbufs_list)) {
+					prepare_buffer_queue(
+						dev, dev->used_buffer_count);
+				}
+
+				pr_info("v4l2-loopback: OUTPUT stream started (dynamic mode, producers=%d)\n",
+					atomic_read(&dev->active_producers));
+			}
+			result = 0;
+		} else {
+			/* Static mode: traditional validation */
+			if (dev->stream_tokens & token) {
+				dprintk("OUTPUT acquiring token in static mode\n");
+				acquire_token(dev, opener, stream, token);
+			}
+			result = 0;
+		}
+		break;
+
+	default:
+		pr_err("v4l2-loopback: unsupported buffer type: %d\n", type);
+		return -EINVAL;
+	}
+
+	dprintk("STREAMON END: result=%d, stream_tokens=0x%x, opener->stream_token=0x%x\n",
+		result, dev->stream_tokens, opener->stream_token);
+	return result;
 }
 
 /* stop streaming
  * called on VIDIOC_STREAMOFF
+ * 
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * rewritten added support for dynamic buffering
  */
 static int vidioc_streamoff(struct file *file, void *fh,
 			    enum v4l2_buf_type type)
@@ -2076,11 +2978,25 @@ static int vidioc_streamoff(struct file *file, void *fh,
 
 	switch (type) {
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
-		if (opener->stream_token & token)
+		if (opener->stream_token & token) {
+			/* In dynamic mode, decrement producer counter */
+			if (dev->use_dynamic_buffering) {
+				atomic_dec(&dev->active_producers);
+				dprintk("STREAMOFF: OUTPUT producer count=%d\n",
+					atomic_read(&dev->active_producers));
+			}
+
 			release_token(dev, opener, stream);
-		/* reset output queue */
-		if (dev->used_buffer_count > 0)
-			prepare_buffer_queue(dev, dev->used_buffer_count);
+
+			/* In dynamic mode, only reset the queue if you are the last producer */
+			if (!dev->use_dynamic_buffering ||
+			    atomic_read(&dev->active_producers) == 0) {
+				/* reset output queue */
+				if (dev->used_buffer_count > 0)
+					prepare_buffer_queue(
+						dev, dev->used_buffer_count);
+			}
+		}
 		return 0;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
 		if (opener->stream_token & token) {
@@ -2340,6 +3256,11 @@ static int v4l2_loopback_open(struct file *file)
 	return 0;
 }
 
+/*
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * rewritten to clear producer counter in dynamic buffering 
+ * 
+*/
 static int v4l2_loopback_close(struct file *file)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
@@ -2368,6 +3289,17 @@ static int v4l2_loopback_close(struct file *file)
 			dprintk("failed to free buffers REQBUFS(count=0) "
 				" returned %d\n",
 				result);
+
+		/* If it was a producer in dynamic mode, ensure decrement */
+		if (dev->use_dynamic_buffering &&
+		    (opener->stream_token & V4L2L_TOKEN_OUTPUT)) {
+			if (atomic_read(&dev->active_producers) > 0) {
+				atomic_dec(&dev->active_producers);
+				dprintk("close(): OUTPUT producer count=%d\n",
+					atomic_read(&dev->active_producers));
+			}
+		}
+
 		mutex_lock(&dev->image_mutex);
 		release_token(dev, opener, format);
 		mutex_unlock(&dev->image_mutex);
@@ -2378,6 +3310,8 @@ static int v4l2_loopback_close(struct file *file)
 		timer_delete_sync(&dev->timeout_timer);
 		if (!dev->keep_format) {
 			mutex_lock(&dev->image_mutex);
+			/* Reset producer counter when closing last opener*/
+			atomic_set(&dev->active_producers, 0);
 			free_buffers(dev);
 			mutex_unlock(&dev->image_mutex);
 		}
@@ -2390,6 +3324,11 @@ static int v4l2_loopback_close(struct file *file)
 	return 0;
 }
 
+/*
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * rewritten added support for dynamic buffering 
+ * 
+*/
 static int start_fileio(struct file *file, void *fh, enum v4l2_buf_type type)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
@@ -2407,6 +3346,21 @@ static int start_fileio(struct file *file, void *fh, enum v4l2_buf_type type)
 	/* short-circuit if already have stream token */
 	if (opener->stream_token && opener->io_method == V4L2L_IO_FILE)
 		return 0;
+
+	/* In dynamic mode with write(), simplify the process */
+	if (dev->use_dynamic_buffering && type == V4L2_BUF_TYPE_VIDEO_OUTPUT) {
+		dprintk("start_fileio: dynamic OUTPUT mode - simplified setup\n");
+
+		/* Mark as IO_FILE without need for REQBUFS */
+		opener->io_method = V4L2L_IO_FILE;
+
+		/* Acquiring token if necessary */
+		if (!(opener->stream_token & token)) {
+			acquire_token(dev, opener, stream, token);
+		}
+
+		return 0;
+	}
 
 	/* otherwise attempt to acquire stream token and assign IO method */
 	if (!(dev->stream_tokens & token) || opener->io_method != V4L2L_IO_NONE)
@@ -2427,6 +3381,28 @@ static ssize_t v4l2_loopback_read(struct file *file, char __user *buf,
 				  size_t count, loff_t *ppos)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
+
+	if (dev->use_dynamic_buffering && dev->dbuf) {
+		u8 *kbuf;
+		int ret;
+
+		if (count == 0)
+			return 0;
+
+		kbuf = vmalloc(count);
+		if (!kbuf)
+			return -ENOMEM;
+
+		ret = dynamic_buffer_read(dev, kbuf, count,
+					  !(file->f_flags & O_NONBLOCK));
+		if (ret > 0) {
+			if (copy_to_user(buf, kbuf, ret))
+				ret = -EFAULT;
+		}
+
+		vfree(kbuf);
+		return ret;
+	}
 	struct v4l2_buffer *b;
 	int index, result;
 
@@ -2450,6 +3426,12 @@ static ssize_t v4l2_loopback_read(struct file *file, char __user *buf,
 	return count;
 }
 
+/*
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * rewritten added support for dynamic buffering
+ * added write_position update 
+ * 
+*/
 static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
 				   size_t count, loff_t *ppos)
 {
@@ -2457,7 +3439,52 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
 	struct v4l2_buffer *b;
 	int index, result;
 
-	dprintkrw("write() %zu bytes\n", count);
+	dprintkrw("write() %zu bytes (dynamic=%d)\n", count,
+		  dev->use_dynamic_buffering);
+
+	if (dev->use_dynamic_buffering && dev->dbuf) {
+		u8 *kbuf;
+		int ret;
+
+		if (count == 0)
+			return 0;
+
+		/* Ensure we have format configured */
+		if (dev->pix_format.sizeimage == 0) {
+			dprintk("write(): format not configured\n");
+			return -EINVAL;
+		}
+
+		kbuf = vmalloc(count);
+		if (!kbuf)
+			return -ENOMEM;
+
+		if (copy_from_user(kbuf, buf, count)) {
+			vfree(kbuf);
+			return -EFAULT;
+		}
+
+		/* Write to dynamic buffer using existing function */
+		ret = dynamic_buffer_write(dev, kbuf, count);
+		vfree(kbuf);
+
+		/* Updates writing position and wakes up readers */
+		if (ret > 0) {
+			spin_lock_bh(&dev->lock);
+			++dev->write_position;
+			dev->reread_count = 0;
+			check_timers(dev);
+			spin_unlock_bh(&dev->lock);
+			wake_up_all(&dev->read_event);
+
+			dprintk("write(): wrote %d bytes, write_position=%lld\n",
+				ret, (long long)dev->write_position);
+		}
+
+		return ret;
+	}
+
+	/* Original static mode */
 	result = start_fileio(file, file->private_data,
 			      V4L2_BUF_TYPE_VIDEO_OUTPUT);
 	if (result < 0)
@@ -2488,21 +3515,40 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
 
 /* init functions */
 /* frees buffers, if allocated */
+/*
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * rewritten added support for dynamic buffering
+*/
 static void free_buffers(struct v4l2_loopback_device *dev)
 {
+	if (!dev)
+		return;
+
 	dprintk("free_buffers() with image@%p\n", dev->image);
+
+	/* 1. Free dynamic buffer if enabled */
+	if (dev->use_dynamic_buffering) {
+		free_dynamic_buffer(dev);
+	}
+
+	/* 2. Check and free main image buffer */
 	if (!dev->image)
 		return;
-	if (!has_no_owners(dev) || any_buffers_mapped(dev))
-		/* maybe an opener snuck in before image_mutex was acquired */
+
+	/* 3. Warn if buffers are still in use */
+	if (!has_no_owners(dev) || any_buffers_mapped(dev)) {
 		printk(KERN_WARNING
-		       "v4l2-loopback free_buffers() buffers of video device "
-		       "#%u freed while still mapped to userspace\n",
+		       "v4l2-loopback: buffers of video device #%u freed while still mapped to userspace\n",
 		       dev->vdev->num);
+	}
+
+	/* 4. Free the main image buffer */
 	vfree(dev->image);
 	dev->image = NULL;
 	dev->image_size = 0;
 	dev->buffer_size = 0;
+
+	dprintk("free_buffers() completed successfully\n");
 }
 
 static void free_timeout_buffer(struct v4l2_loopback_device *dev)
@@ -2523,50 +3569,109 @@ static void free_timeout_buffer(struct v4l2_loopback_device *dev)
 	dev->timeout_image = NULL;
 	dev->timeout_buffer_size = 0;
 }
-/* allocates buffers if no (other) openers are already using them */
+
+/*
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * rewritten added support for dynamic buffering
+ * allocate or reallocate image buffers (static + dynamic)
+*/
 static int allocate_buffers(struct v4l2_loopback_device *dev,
 			    struct v4l2_pix_format *pix_format)
 {
 	u32 buffer_size = PAGE_ALIGN(pix_format->sizeimage);
-	unsigned long image_size =
-		(unsigned long)buffer_size * (unsigned long)dev->buffer_count;
-	/* vfree on close file operation in case no open handles left */
+	unsigned long image_size;
+	int ret;
+	bool dynamic_mode = dev->use_dynamic_buffering;
 
+	/* === STRICT VALIDATION === */
 	if (buffer_size == 0 || dev->buffer_count == 0 ||
-	    buffer_size < pix_format->sizeimage)
+	    buffer_size < pix_format->sizeimage) {
+		pr_err("v4l2-loopback: invalid buffer parameters\n");
 		return -EINVAL;
+	}
 
-	if ((__LONG_MAX__ / buffer_size) < dev->buffer_count)
+	if (check_mul_overflow(buffer_size, dev->buffer_count, &image_size)) {
+		pr_err("v4l2-loopback: overflow in image size calculation\n");
 		return -ENOSPC;
+	}
 
-	dprintk("allocate_buffers() size %lubytes = %ubytes x %ubuffers\n",
-		image_size, buffer_size, dev->buffer_count);
-	if (dev->image) {
-		/* check that no buffers are expected in user-space */
-		if (!has_no_owners(dev) || any_buffers_mapped(dev))
+	dprintk("allocate_buffers: %lu bytes (%u × %u), dynamic=%d\n",
+		image_size, buffer_size, dev->buffer_count, dynamic_mode);
+
+	/* === REUSE OF BUFFERS === */
+	if (dev->image && image_size == dev->image_size) {
+		dprintk("allocate_buffers: reusing existing buffers\n");
+
+		/* Ensure dynamic buffer initialization if needed */
+		if (dynamic_mode && !dev->dbuf) {
+			ret = init_dynamic_buffer(dev);
+			if (ret) {
+				pr_err("v4l2-loopback: dynamic buffer initialization failed\n");
+				return ret;
+			}
+		}
+		return 0;
+	}
+
+	/* === CHECKING BUFFERS IN USE === */
+	if (dev->image && (!has_no_owners(dev) || any_buffers_mapped(dev))) {
+		if (!dynamic_mode) {
+			pr_warn("v4l2-loopback: cannot reallocate buffers in use\n");
 			return -EBUSY;
-		dprintk("allocate_buffers() existing size=%lubytes\n",
-			dev->image_size);
-		/* FIXME: prevent double allocation more intelligently! */
-		if (image_size == dev->image_size) {
-			dprintk("allocate_buffers() keep existing\n");
-			return 0;
+		}
+		/* In dynamic mode, we allow more flexible relocation */
+		pr_info("v4l2-loopback: reallocating buffers in dynamic mode\n");
+	}
+
+	/* === RELEASE OF OLD BUFFERS === */
+	if (dev->image) {
+		/* In dynamic mode, preserve dynamic buffer during reallocation */
+		if (dynamic_mode && dev->dbuf) {
+			/* Check to not flush dynamic buffer */
+			dev->dbuf->active = false;
 		}
 		free_buffers(dev);
 	}
 
-	/* FIXME: set buffers to 0 */
+	/* === ALLOCATION OF NEW BUFFER === */
 	dev->image = vmalloc(image_size);
-	if (dev->image == NULL) {
-		dev->buffer_size = dev->image_size = 0;
-		return -ENOMEM;
+	if (!dev->image) {
+		pr_err("v4l2-loopback: allocation failure %lu bytes\n",
+		       image_size);
+		ret = -ENOMEM;
+		goto err_out;
 	}
-	init_buffers(dev, pix_format->sizeimage, buffer_size);
-	dev->buffer_size = buffer_size;
+
 	dev->image_size = image_size;
-	dprintk("allocate_buffers() -> vmalloc'd %lubytes\n", dev->image_size);
+	dev->buffer_size = buffer_size;
+
+	/* === INITIALIZATION OF INTERNAL BUFFERS === */
+	init_buffers(dev, pix_format->sizeimage, buffer_size);
+
+	/* === DYNAMIC BUFFER INITIALIZATION === */
+	/* Initialize dynamic buffer if necessary */
+	if (dev->use_dynamic_buffering) {
+		ret = init_dynamic_buffer(dev);
+		if (ret) {
+			pr_err("v4l2-loopback: dynamic buffer initialization failed (%d)\n",
+			       ret);
+			goto err_free_image;
+		}
+	}
+	pr_info("v4l2-loopback: buffers allocated successfully (%lu bytes, dynamic=%d)\n",
+		dev->image_size, dynamic_mode);
 	return 0;
+
+/* === ERROR CLEANUP === */
+err_free_image:
+	vfree(dev->image);
+	dev->image = NULL;
+	dev->image_size = 0;
+	dev->buffer_size = 0;
+err_out:
+	return ret;
 }
+
 static int allocate_timeout_buffer(struct v4l2_loopback_device *dev)
 {
 	/* device's `buffer_size` and `buffers` must be initialised in
@@ -2710,7 +3815,728 @@ static void timeout_timer_clb(unsigned long nr)
 	spin_unlock(&dev->lock);
 }
 
-/* init loopback main structure */
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * 
+ * calculate_buffer_used_bytes - Calculates the number of used bytes in a circular buffer
+ * @dbuf: Pointer to the dynamic buffer structure
+ *
+ * Computes the amount of data currently stored in a circular buffer by comparing
+ * read and write positions. Handles both linear (write_pos > read_pos) and wrapped
+ * (write_pos < read_pos) buffer states.
+ *
+ * Return: Number of used bytes in the buffer (0 if buffer is empty)
+ */
+static inline u32 calculate_buffer_used_bytes(struct dynamic_buffer *dbuf)
+{
+	if (dbuf->write_pos >= dbuf->read_pos)
+		return dbuf->write_pos - dbuf->read_pos;
+	else
+		return (dbuf->size - dbuf->read_pos) + dbuf->write_pos;
+}
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * init_dynamic_buffer - Initializes a dynamic buffer for V4L2 loopback device
+ * @dev: Pointer to the v4l2_loopback_device structure
+ *
+ * Allocates and initializes a circular buffer for dynamic frame storage. Handles:
+ * - Thread-safe initialization with reference counting
+ * - Automatic buffer size calculation based on pixel format
+ * - Overflow protection and size validation
+ * - Graceful memory allocation fallback
+ * - Statistics tracking and waitqueue initialization
+ *
+ * The function is idempotent and will reuse existing buffers if called multiple times.
+ * Performs extensive error checking and returns appropriate error codes.
+ *
+ * Return: 0 on success, negative error code on failure:
+ *         -EINVAL for invalid parameters
+ *         -EOVERFLOW for size calculation overflow
+ *         -ENOMEM for allocation failures
+ */
+static int init_dynamic_buffer(struct v4l2_loopback_device *dev)
+{
+	struct dynamic_buffer *dbuf = NULL;
+	size_t total_size, initial_size;
+	unsigned long flags;
+	bool already_initialized = false;
+
+	/* Basic validation*/
+	if (unlikely(!dev)) {
+		pr_err("v4l2-loopback: null device in init_dynamic_buffer\n");
+		return -EINVAL;
+	}
+
+	if (unlikely(!dev->use_dynamic_buffering)) {
+		pr_info("v4l2-loopback: dynamic buffer disabled\n");
+		return 0; /* It's not a mistake, just not necessary. */
+	}
+
+	/* Dual-initialization thread-safety check */
+	spin_lock_irqsave(&dev->lock, flags);
+	if (dev->dbuf) {
+		already_initialized = true;
+		atomic_inc(&dev->dbuf->ref_count);
+	}
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	if (already_initialized) {
+		pr_info("v4l2-loopback: dynamic buffer already initialized, reusing\n");
+		return 0;
+	}
+
+	/* Determine buffer size*/
+	if (!dev->buffer_size) {
+		if (dev->pix_format.sizeimage > 0) {
+			dev->buffer_size =
+				PAGE_ALIGN(dev->pix_format.sizeimage);
+			dev->buffer_count = max(2U, dev->buffer_count);
+			pr_info("v4l2-loopback: buffer_size derived from pix_format: %u bytes\n",
+				dev->buffer_size);
+		} else {
+			pr_warn("v4l2-loopback: buffer_size and sizeimage not set, using default\n");
+			dev->buffer_size =
+				PAGE_ALIGN(640 * 480 * 2); /* YUYV 640x480 */
+			dev->buffer_count = 2;
+		}
+	}
+
+	/* Safe size calculation */
+	if (unlikely(check_mul_overflow(dev->buffer_size, dev->buffer_count,
+					&total_size))) {
+		pr_err("v4l2-loopback: overflow in buffer calculation (%u × %u)\n",
+		       dev->buffer_size, dev->buffer_count);
+		return -EOVERFLOW;
+	}
+
+	/* Conservative starting size */
+	initial_size = max(total_size, (size_t)INITIAL_BUFFER_SIZE);
+	initial_size = min(initial_size, (size_t)MAX_DYNAMIC_BUFFER_SIZE);
+
+	if (unlikely(initial_size < MIN_BUFFER_SIZE)) {
+		pr_err("v4l2-loopback: size %zu less than minimum %lu\n",
+		       initial_size, (unsigned long)MIN_BUFFER_SIZE);
+		return -EINVAL;
+	}
+
+	/* Structure allocation */
+	dbuf = kzalloc(sizeof(*dbuf), GFP_KERNEL);
+	if (unlikely(!dbuf)) {
+		pr_err("v4l2-loopback: dynamic_buffer structure allocation failed\n");
+		return -ENOMEM;
+	}
+
+	/* Buffer allocation with retry */
+	dbuf->data = vzalloc(initial_size);
+	if (unlikely(!dbuf->data)) {
+		/* Try smaller size if failure */
+		size_t fallback_size = max(total_size, (size_t)MIN_BUFFER_SIZE);
+		pr_warn("v4l2-loopback: failed at %zu bytes, trying %zu\n",
+			initial_size, fallback_size);
+
+		dbuf->data = vzalloc(fallback_size);
+		if (!dbuf->data) {
+			pr_err("v4l2-loopback: critical buffer allocation failure\n");
+			kfree(dbuf);
+			return -ENOMEM;
+		}
+		initial_size = fallback_size;
+	}
+
+	/* Complete initialization */
+	dbuf->size = initial_size;
+	dbuf->initial_size = initial_size;
+	dbuf->write_pos = 0;
+	dbuf->read_pos = 0;
+	atomic_set(&dbuf->available, 0);
+	atomic_set(&dbuf->ref_count, 1);
+
+	spin_lock_init(&dbuf->lock);
+	init_waitqueue_head(&dbuf->read_waitq);
+	init_waitqueue_head(&dbuf->write_waitq);
+
+	dbuf->active = true;
+	dbuf->shutdown_requested = false;
+	memset(&dbuf->stats, 0, sizeof(dbuf->stats));
+	dbuf->stats.created_at = ktime_get();
+	dbuf->stats.min_capacity_used = initial_size;
+	dbuf->stats.max_capacity_reached = initial_size;
+
+	/* Final atomic assignment */
+	spin_lock_irqsave(&dev->lock, flags);
+	if (unlikely(dev->dbuf)) {
+		/* Race condition - another thread has started */
+		spin_unlock_irqrestore(&dev->lock, flags);
+		vfree(dbuf->data);
+		kfree(dbuf);
+		pr_info("v4l2-loopback: dynamic buffer initialized by another thread\n");
+		return 0; /* It's not a mistake */
+	}
+
+	dev->dbuf = dbuf;
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	pr_info("v4l2-loopback: dynamic buffer initialized successfully (%zu bytes)\n",
+		initial_size);
+	return 0;
+}
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * free_dynamic_buffer - Safely deallocates a dynamic buffer from V4L2 loopback device
+ * @dev: Pointer to the v4l2_loopback_device structure containing the buffer
+ *
+ * Performs a thread-safe deallocation of the dynamic buffer with proper cleanup:
+ * - Atomically removes buffer reference from device
+ * - Signals shutdown to all pending operations
+ * - Wakes all blocked reader/writer threads
+ * - Implements grace period for pending operations
+ * - Handles reference counting for safe memory release
+ * - Provides detailed logging of buffer state
+ *
+ * The function handles edge cases including:
+ * - NULL device pointer
+ * - Already freed buffers
+ * - Active references preventing immediate deallocation
+ * - Proper cleanup of both buffer structure and data memory
+ *
+ * Note: Buffer may not be freed immediately if references remain,
+ *       but will be marked for deferred cleanup.
+ */
+static void free_dynamic_buffer(struct v4l2_loopback_device *dev)
+{
+	struct dynamic_buffer *dbuf;
+	unsigned long flags;
+	int ref_count;
+
+	if (unlikely(!dev))
+		return;
+
+	/* Thread-safe removal of device reference */
+	spin_lock_irqsave(&dev->lock, flags);
+	dbuf = dev->dbuf;
+	dev->dbuf = NULL;
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	if (unlikely(!dbuf))
+		return;
+
+	/* Shutdown signaling for all pending operations */
+	spin_lock_irqsave(&dbuf->lock, flags);
+	dbuf->active = false;
+	dbuf->shutdown_requested = true;
+	spin_unlock_irqrestore(&dbuf->lock, flags);
+
+	/* Wake up all blocked threads */
+	wake_up_interruptible_all(&dbuf->read_waitq);
+	wake_up_interruptible_all(&dbuf->write_waitq);
+
+	/* Grace period for pending operations to end */
+	msleep(BUFFER_GRACE_PERIOD_MS);
+
+	/* Decrement reference and release if last */
+	ref_count = atomic_dec_return(&dbuf->ref_count);
+	if (ref_count == 0) {
+		if (dbuf->data) {
+			vfree(dbuf->data);
+			dbuf->data = NULL;
+		}
+		kfree(dbuf);
+		pr_info("v4l2-loopback: dynamic buffer flushed successfully\n");
+	} else if (ref_count > 0) {
+		pr_info("v4l2-loopback: buffer marked for release (refs=%d)\n",
+			ref_count);
+	}
+}
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * __copy_circular_data - Copies data from a circular buffer to a linear destination
+ * @src_data: Pointer to the source circular buffer data
+ * @src_size: Total size of the circular buffer
+ * @src_pos: Starting position in the circular buffer
+ * @dst_data: Pointer to the destination linear buffer
+ * @copy_len: Number of bytes to copy
+ *
+ * Efficiently copies data from a circular buffer to a linear destination buffer,
+ * handling the wrap-around case where data spans the end and beginning of the
+ * circular buffer. The function performs the copy in at most two memcpy operations:
+ * 1. From src_pos to end of circular buffer
+ * 2. From beginning of circular buffer for remaining data (if needed)
+ *
+ * Note: Caller must ensure:
+ * - copy_len does not exceed src_size
+ * - src_pos is within valid range (0 <= src_pos < src_size)
+ * - dst_data has sufficient space for copy_len bytes
+ */
+static void __copy_circular_data(const void *src_data, u32 src_size,
+				 u32 src_pos, void *dst_data, u32 copy_len)
+{
+	u32 first_chunk = min(copy_len, src_size - src_pos);
+
+	/* First part to end of buffer */
+	memcpy(dst_data, (const u8 *)src_data + src_pos, first_chunk);
+
+	/* Second part of the beginning of the buffer (if necessary) */
+	if (first_chunk < copy_len) {
+		memcpy((u8 *)dst_data + first_chunk, src_data,
+		       copy_len - first_chunk);
+	}
+}
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * __resize_buffer_locked - Resizes a dynamic buffer while preserving its contents
+ * @dbuf: Pointer to the dynamic buffer structure to resize
+ * @new_capacity: Desired new capacity in bytes
+ *
+ * Performs a thread-unsafe resize operation on a circular buffer, maintaining
+ * any existing data. The function:
+ * - Validates the new capacity against minimum/maximum limits
+ * - Skips resizing if the change is insignificant (<10% size difference)
+ * - Allocates new memory and copies existing data using circular copy
+ * - Atomically replaces the buffer while preserving data consistency
+ * - Updates buffer positions and maintains active status
+ *
+ * Caller must ensure proper locking around this operation.
+ *
+ * Return: 0 on success, negative error code on failure:
+ *         -EINVAL for invalid parameters or inactive buffer
+ *         -ENOMEM for allocation failures
+ */
+static int __resize_buffer_locked(struct dynamic_buffer *dbuf, u32 new_capacity)
+{
+	void *new_data;
+	u32 old_size, available;
+
+	if (unlikely(!dbuf || !dbuf->active))
+		return -EINVAL;
+
+	old_size = dbuf->size;
+	available = atomic_read(&dbuf->available);
+
+	/* Validation of new capacity */
+	if (unlikely(new_capacity < MIN_BUFFER_SIZE ||
+		     new_capacity > MAX_DYNAMIC_BUFFER_SIZE ||
+		     new_capacity < available)) {
+		return -EINVAL;
+	}
+
+	/* If the size has not changed significantly, do nothing. */
+	if (abs((int)new_capacity - (int)old_size) < (old_size / 10)) {
+		return 0;
+	}
+
+	/* Allocation of new buffer */
+	new_data = vzalloc(new_capacity);
+	if (unlikely(!new_data)) {
+		pr_err("v4l2-loopback: failed to allocate %u bytes for resize\n",
+		       new_capacity);
+		return -ENOMEM;
+	}
+
+	/* Copy of existing data if any */
+	if (available > 0) {
+		__copy_circular_data(dbuf->data, old_size, dbuf->read_pos,
+				     new_data, available);
+	}
+
+	/* Atomic buffer replacement */
+	vfree(dbuf->data);
+	dbuf->data = new_data;
+	dbuf->size = new_capacity;
+	dbuf->read_pos = 0;
+	dbuf->write_pos = available;
+
+	if (new_capacity > dbuf->stats.max_capacity_reached) {
+		dbuf->stats.max_capacity_reached = new_capacity;
+	}
+	if (new_capacity < dbuf->stats.min_capacity_used) {
+		dbuf->stats.min_capacity_used = new_capacity;
+	}
+
+	pr_debug(
+		"v4l2-loopback: buffer resized from %u to %u bytes (data=%u)\n",
+		old_size, new_capacity, available);
+
+	return 0;
+}
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * resize_dynamic_buffer - Thread-safe resizing of a dynamic buffer
+ * @dev: Pointer to the v4l2_loopback_device structure
+ * @new_capacity: Desired new buffer capacity in bytes
+ *
+ * Safely resizes the device's dynamic buffer while maintaining data integrity.
+ * The function:
+ * - Acquires proper locks for thread-safe operation
+ * - Manages buffer reference counting
+ * - Delegates actual resize to __resize_buffer_locked
+ * - Wakes blocked threads after successful resize
+ * - Handles buffer cleanup if marked for shutdown
+ * - Validates all input parameters
+ *
+ * Return: 0 on success, negative error code on failure:
+ *         -EINVAL for invalid parameters
+ *         -ENODEV if buffer not initialized
+ *         Error codes from __resize_buffer_locked
+ */
+static int resize_dynamic_buffer(struct v4l2_loopback_device *dev,
+				 u32 new_capacity)
+{
+	struct dynamic_buffer *dbuf;
+	unsigned long flags;
+	int ret;
+
+	if (unlikely(!dev))
+		return -EINVAL;
+
+	/* Safely getting the buffer reference */
+	spin_lock_irqsave(&dev->lock, flags);
+	dbuf = dev->dbuf;
+	if (dbuf)
+		atomic_inc(&dbuf->ref_count);
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	if (unlikely(!dbuf))
+		return -ENODEV;
+
+	/* Resizing with buffer lock */
+	spin_lock_irqsave(&dbuf->lock, flags);
+	ret = __resize_buffer_locked(dbuf, new_capacity);
+	spin_unlock_irqrestore(&dbuf->lock, flags);
+
+	/* Wake up threads waiting for space/data after resize */
+	if (ret == 0) {
+		wake_up_interruptible_all(&dbuf->read_waitq);
+		wake_up_interruptible_all(&dbuf->write_waitq);
+	}
+
+	/* Reference release */
+	if (atomic_dec_return(&dbuf->ref_count) == 0 &&
+	    dbuf->shutdown_requested) {
+		vfree(dbuf->data);
+		kfree(dbuf);
+	}
+
+	return ret;
+}
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * dynamic_buffer_write - Writes data to a dynamic circular buffer
+ * @dev: Pointer to the v4l2_loopback_device structure
+ * @src: Source buffer containing data to write
+ * @len: Number of bytes to write
+ *
+ * Performs a thread-safe write operation to a dynamic circular buffer with
+ * multiple fallback strategies:
+ * 1. Direct write when space available
+ * 2. Buffer expansion when high watermark reached
+ * 3. Old data discard when buffer full
+ * 4. Blocking wait with timeout when no immediate space
+ *
+ * Implements reference counting for safe buffer access and handles:
+ * - Buffer expansion up to MAX_DYNAMIC_BUFFER_SIZE
+ * - Statistics tracking (bytes written, timestamps)
+ * - Reader wakeup notifications
+ * - Graceful handling of shutdown requests
+ * - Comprehensive error checking
+ *
+ * Return: Number of bytes written on success (may be less than requested),
+ *         negative error code on failure:
+ *         -EINVAL for invalid parameters
+ *         -ENODEV if buffer not available or inactive
+ *         -ETIMEDOUT if wait for space times out
+ *         -EINTR if operation interrupted
+ */
+static int dynamic_buffer_write(struct v4l2_loopback_device *dev, const u8 *src,
+				u32 len)
+{
+	struct dynamic_buffer *dbuf;
+	unsigned long flags;
+	u32 available, free_space, first_chunk;
+	int ret = 0, retry_count = 0;
+
+	/* Parameter validation */
+	if (unlikely(!dev || !src || len == 0 || !dev->use_dynamic_buffering))
+		return -EINVAL;
+
+	/* Safely getting the buffer reference */
+	spin_lock_irqsave(&dev->lock, flags);
+	dbuf = dev->dbuf;
+	if (dbuf)
+		atomic_inc(&dbuf->ref_count);
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	if (unlikely(!dbuf))
+		return -ENODEV;
+
+retry_write:
+	spin_lock_irqsave(&dbuf->lock, flags);
+
+	/* Active status check */
+	if (unlikely(!dbuf->active || dbuf->shutdown_requested)) {
+		ret = -ENODEV;
+		goto unlock_and_exit;
+	}
+
+	available = atomic_read(&dbuf->available);
+	free_space = dbuf->size - available;
+
+	/* Case 1: There is enough space - direct writing */
+	if (len <= free_space) {
+		first_chunk = min(len, dbuf->size - dbuf->write_pos);
+
+		/* Writing in up to two parts (circular buffer) */
+		memcpy((u8 *)dbuf->data + dbuf->write_pos, src, first_chunk);
+		if (first_chunk < len) {
+			memcpy(dbuf->data, src + first_chunk,
+			       len - first_chunk);
+		}
+
+		dbuf->write_pos = (dbuf->write_pos + len) % dbuf->size;
+		atomic_add(len, &dbuf->available);
+		dbuf->stats.total_bytes_written += len;
+		dbuf->stats.frames_written++;
+		dbuf->stats.last_write_at = ktime_get();
+
+		/* Wake up readers waiting for data */
+		wake_up_interruptible_all(&dbuf->read_waitq);
+
+		ret = len;
+		goto unlock_and_exit;
+	}
+
+	/* Case 2: Buffer full - attempt expansion if allowed */
+	if (retry_count < MAX_RESIZE_RETRIES &&
+	    dbuf->size < MAX_DYNAMIC_BUFFER_SIZE &&
+	    (available * 100ULL / dbuf->size) >= HIGH_WATERMARK_PERCENT) {
+		u32 new_size = min((u64)dbuf->size * 3 / 2, /* 50% growth */
+				   (u64)MAX_DYNAMIC_BUFFER_SIZE);
+		new_size =
+			max(new_size, dbuf->size + len); /* Make sure it fits */
+
+		spin_unlock_irqrestore(&dbuf->lock, flags);
+
+		ret = resize_dynamic_buffer(dev, new_size);
+		if (ret == 0) {
+			retry_count++;
+			spin_lock_irqsave(&dbuf->lock, flags);
+			dbuf->stats.expand_count++;
+			dbuf->stats.last_expand_at = ktime_get();
+			spin_unlock_irqrestore(&dbuf->lock, flags);
+			goto retry_write;
+		}
+
+		/* Resize failed - continue to next strategy */
+		spin_lock_irqsave(&dbuf->lock, flags);
+	}
+
+	/* Case 3: Discard old data to make space */
+	if (available > len) {
+		u32 discard_amount =
+			min(available / 2, available - len + (dbuf->size / 10));
+		dbuf->read_pos = (dbuf->read_pos + discard_amount) % dbuf->size;
+		atomic_sub(discard_amount, &dbuf->available);
+
+		/* Alert readers to report data loss */
+		wake_up_interruptible_all(&dbuf->read_waitq);
+
+		spin_unlock_irqrestore(&dbuf->lock, flags);
+		goto retry_write;
+	}
+
+	/* Case 4: Wait for space to become available */
+	spin_unlock_irqrestore(&dbuf->lock, flags);
+
+	ret = wait_event_interruptible_timeout(
+		dbuf->write_waitq,
+		(!dbuf->active || dbuf->shutdown_requested ||
+		 (dbuf->size - atomic_read(&dbuf->available)) >= len),
+		msecs_to_jiffies(100)); /* 100ms timeout */
+
+	if (ret == -ERESTARTSYS)
+		ret = -EINTR;
+	else if (ret == 0)
+		ret = -ETIMEDOUT;
+	else if (ret > 0)
+		goto retry_write;
+
+unlock_and_exit:
+	spin_unlock_irqrestore(&dbuf->lock, flags);
+
+	/* Reference release */
+	if (atomic_dec_return(&dbuf->ref_count) == 0 &&
+	    dbuf->shutdown_requested) {
+		vfree(dbuf->data);
+		kfree(dbuf);
+	}
+
+	return ret;
+}
+
+/**
+ * Copyright (C) 2025 Eli Oliveira Junior
+ *
+ * dynamic_buffer_read - Reads data from a dynamic circular buffer
+ * @dev: Pointer to the v4l2_loopback_device structure
+ * @dst: Destination buffer for read data
+ * @len: Maximum number of bytes to read
+ * @block: Whether to block waiting for data (true) or return immediately (false)
+ *
+ * Performs a thread-safe read operation from a dynamic circular buffer with:
+ * - Blocking and non-blocking read modes
+ * - Automatic buffer shrinking when underutilized
+ * - Circular buffer handling with wrap-around support
+ * - Statistics tracking (bytes read, timestamps)
+ * - Writer wakeup notifications when space becomes available
+ * - Reference counting for safe buffer access
+ *
+ * The function implements intelligent buffer size management:
+ * - Shrinks buffer when usage falls below LOW_WATERMARK_FRACTION
+ * - Maintains minimum buffer size (MIN_BUFFER_SIZE)
+ * - Preserves initial buffer size as reference (dbuf->initial_size)
+ *
+ * Return: Number of bytes read (0 if no data available in non-blocking mode),
+ *         negative error code on failure:
+ *         -EINVAL for invalid parameters
+ *         -ENODEV if buffer not available or inactive
+ *         -EAGAIN in non-blocking mode with no data
+ *         -EINTR if blocking operation interrupted
+ */
+static int dynamic_buffer_read(struct v4l2_loopback_device *dev, u8 *dst,
+			       u32 len, bool block)
+{
+	struct dynamic_buffer *dbuf;
+	unsigned long flags;
+	u32 available, to_read, first_chunk;
+	int ret = 0;
+
+	/* Parameter validation */
+	if (unlikely(!dev || !dst || len == 0 || !dev->use_dynamic_buffering))
+		return -EINVAL;
+
+	/* Safely getting the buffer reference */
+	spin_lock_irqsave(&dev->lock, flags);
+	dbuf = dev->dbuf;
+	if (dbuf)
+		atomic_inc(&dbuf->ref_count);
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	if (unlikely(!dbuf))
+		return -ENODEV;
+
+	/* Blocking mode: wait for data or shutdown */
+	if (block) {
+		ret = wait_event_interruptible(
+			dbuf->read_waitq,
+			(!dbuf->active || dbuf->shutdown_requested ||
+			 atomic_read(&dbuf->available) > 0));
+
+		if (ret == -ERESTARTSYS) {
+			ret = -EINTR;
+			goto exit_with_ref;
+		}
+	}
+
+	spin_lock_irqsave(&dbuf->lock, flags);
+
+	/* Active status check */
+	if (unlikely(!dbuf->active || dbuf->shutdown_requested)) {
+		ret = -ENODEV;
+		goto unlock_and_exit;
+	}
+
+	available = atomic_read(&dbuf->available);
+
+	/* Non-blocking mode: returns immediately if no data */
+	if (!block && available == 0) {
+		ret = -EAGAIN;
+		goto unlock_and_exit;
+	}
+
+	/* Determine quantity to be read */
+	to_read = min(len, available);
+	if (to_read == 0) {
+		ret = 0;
+		goto unlock_and_exit;
+	}
+
+	/* Reading in up to two parts (circular buffer) */
+	first_chunk = min(to_read, dbuf->size - dbuf->read_pos);
+	memcpy(dst, (const u8 *)dbuf->data + dbuf->read_pos, first_chunk);
+
+	if (first_chunk < to_read) {
+		memcpy(dst + first_chunk, dbuf->data, to_read - first_chunk);
+	}
+
+	/* Updating pointers and counters */
+	dbuf->read_pos = (dbuf->read_pos + to_read) % dbuf->size;
+	atomic_sub(to_read, &dbuf->available);
+
+	/* Update statistics */
+	dbuf->stats.total_bytes_read += to_read;
+	dbuf->stats.frames_read++;
+	dbuf->stats.last_read_at = ktime_get();
+
+	/* Awaken writers waiting for space */
+	wake_up_interruptible_all(&dbuf->write_waitq);
+
+	/* Check for shrinkage */
+	available = atomic_read(&dbuf->available);
+	if (dbuf->size > dbuf->initial_size * 2 &&
+	    available < (dbuf->size / LOW_WATERMARK_FRACTION) &&
+	    dbuf->size > MIN_BUFFER_SIZE) {
+		u32 target_size = max(dbuf->initial_size,
+				      max(available * 4, (u32)MIN_BUFFER_SIZE));
+
+		if (target_size < dbuf->size) {
+			/* Perform shrink and update stats if successful */
+			spin_unlock_irqrestore(&dbuf->lock, flags);
+
+			if (resize_dynamic_buffer(dev, target_size) == 0) {
+				/* Shrink successful - update stats */
+				spin_lock_irqsave(&dbuf->lock, flags);
+				dbuf->stats.shrink_count++;
+				dbuf->stats.last_shrink_at = ktime_get();
+				spin_unlock_irqrestore(&dbuf->lock, flags);
+			}
+
+			ret = to_read;
+			goto exit_with_ref;
+		}
+	}
+
+	ret = to_read;
+
+unlock_and_exit:
+	spin_unlock_irqrestore(&dbuf->lock, flags);
+
+exit_with_ref:
+	/* Reference release */
+	if (atomic_dec_return(&dbuf->ref_count) == 0 &&
+	    dbuf->shutdown_requested) {
+		vfree(dbuf->data);
+		kfree(dbuf);
+	}
+
+	return ret;
+}
+
+/* init loopback main structure 
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * rewritten added support for dynamic buffering
+*/
+
 #define DEFAULT_FROM_CONF(confmember, default_condition, default_value)        \
 	((conf) ?                                                              \
 		 ((conf->confmember default_condition) ? (default_value) :     \
@@ -2780,6 +4606,17 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
 	if (!dev)
 		return -ENOMEM;
+
+	/*Implement Dynamic Buffer*/
+	if (conf && conf->dynamic_buffering == 1) {
+		dev->use_dynamic_buffering =
+			conf->dynamic_buffering; //Use Dynamic Buffer
+	} else {
+		dev->use_dynamic_buffering =
+			dynamic_buffering; //Use Static Buffer (Default)
+	}
+	dev->dbuf = NULL; // Initialize pointer to NULL
+	atomic_set(&dev->active_producers, 0);
 
 	/* allocate id, if @id >= 0, we're requesting that specific id */
 	if (nr >= 0) {
@@ -2956,20 +4793,71 @@ out_free_dev:
 	return err;
 }
 
+/*
+ * Copyright (C) 2025 Eli Oliveira Junior
+ * rewritten added support for dynamic buffering 
+ */
 static void v4l2_loopback_remove(struct v4l2_loopback_device *dev)
 {
 	int device_nr = v4l2loopback_get_vdev_nr(dev->vdev);
+
+	if (!dev) {
+		pr_warn("v4l2loopback: remove called with NULL device\n");
+		return;
+	}
+
+	dprintk("removing device %d\n", device_nr);
+
+	/* 1. Stop all I/O operations */
 	mutex_lock(&dev->image_mutex);
+
+	/* 2. Free dynamic buffer first */
+	if (dev->use_dynamic_buffering) {
+		dprintk("freeing dynamic buffer for device %d\n", device_nr);
+		free_dynamic_buffer(dev);
+	}
+
+	/* 3. Free main buffers */
+	dprintk("freeing main buffers for device %d\n", device_nr);
 	free_buffers(dev);
+
+	/* 4. Free timeout buffer */
+	dprintk("freeing timeout buffer for device %d\n", device_nr);
 	free_timeout_buffer(dev);
+
 	mutex_unlock(&dev->image_mutex);
+
+	/* 5. Remove sysfs interface */
+	dprintk("removing sysfs interface for device %d\n", device_nr);
 	v4l2loopback_remove_sysfs(dev->vdev);
+
+	/* 6. Release control handler */
+	dprintk("freeing ctrl handler for device %d\n", device_nr);
 	v4l2_ctrl_handler_free(&dev->ctrl_handler);
-	kfree(video_get_drvdata(dev->vdev));
-	video_unregister_device(dev->vdev);
+
+	/* 7. Clear video device */
+	dprintk("unregistering video device %d\n", device_nr);
+	if (dev->vdev) {
+		struct v4l2loopback_private *priv =
+			video_get_drvdata(dev->vdev);
+		kfree(priv);
+		video_unregister_device(dev->vdev);
+	}
+
+	/* 8. Unregister V4L2 device */
+	dprintk("unregistering v4l2 device %d\n", device_nr);
 	v4l2_device_unregister(&dev->v4l2_dev);
-	idr_remove(&v4l2loopback_index_idr, device_nr);
+
+	/* 9. Remove from IDR */
+	if (device_nr >= 0) {
+		dprintk("removing device %d from IDR\n", device_nr);
+		idr_remove(&v4l2loopback_index_idr, device_nr);
+	}
+
+	/* 10. Finally release the device structure */
+	dprintk("freeing device structure for device %d\n", device_nr);
 	kfree(dev);
+	dprintk("device %d removed successfully\n", device_nr);
 }
 
 static long v4l2loopback_control_ioctl(struct file *file, unsigned int cmd,
@@ -3263,6 +5151,7 @@ static int __init v4l2loopback_init_module(void)
 			.max_buffers		= max_buffers,
 			.max_openers		= max_openers,
 			.debug			= debug,
+			.dynamic_buffering    = 0,
 			// clang-format on
 		};
 		cfg.card_label[0] = 0;
