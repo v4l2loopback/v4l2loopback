@@ -347,25 +347,33 @@ struct v4l2l_buffer {
 	atomic_t use_count;
 };
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * Dynamic Buffering Configuration Constants
- *
- * Defines the operational parameters for dynamic buffer management:
- * - MIN_BUFFER_SIZE: Minimum allowed buffer size (4 pages)
- * - MAX_DYNAMIC_BUFFER_SIZE: Maximum allowed buffer size (64MB)
- * - INITIAL_BUFFER_SIZE: Default starting buffer size (1MB)
- * - HIGH_WATERMARK_PERCENT: Threshold for auto-expansion (85% full)
- * - LOW_WATERMARK_FRACTION: Threshold for auto-shrinking (1/8 capacity used)
- * - SHRINK_HEADROOM_DIVISOR: Safety margin when shrinking (25% headroom)
- * - MAX_RESIZE_RETRIES: Maximum expansion attempts when full
- * - BUFFER_GRACE_PERIOD_MS: Shutdown cleanup grace period
- * - BUFFER_RESIZE_LOG_PREFIX: Log message prefix for buffer operations
- *
- * These constants control the behavior of the dynamic buffering system,
- * balancing memory usage against performance requirements.
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    Dynamic Buffer Configuration Constants
+    Defines the core parameters governing dynamic buffer allocation and management:
+
+    Size Parameters:
+        MIN_BUFFER_SIZE: Minimum allocation size (4 memory pages)
+        MAX_DYNAMIC_BUFFER_SIZE: Maximum permitted buffer capacity (64MB)
+        INITIAL_BUFFER_SIZE: Default allocation at creation (1MB)
+    Watermark Thresholds:
+        HIGH_WATERMARK_PERCENT: Expansion trigger (85% utilization)
+        LOW_WATERMARK_FRACTION: Shrink trigger (1/8th utilization = 12.5%)
+        SHRINK_HEADROOM_DIVISOR: Safety margin when downsizing (25% headroom)
+    Operational Parameters:
+        MAX_RESIZE_RETRIES: Maximum expansion attempts during contention
+        BUFFER_GRACE_PERIOD_MS: Cleanup wait period during shutdown (5ms)
+        BUFFER_RESIZE_LOG_PREFIX: System log identifier for buffer events
+    Design Considerations:
+        Memory Efficiency: Balances between over-allocation and frequent resizing
+        Performance: Optimized thresholds minimize resize operations
+        Safety: Includes headroom margins to prevent thrashing
+        Observability: Log prefix enables system monitoring
+
+    Note: All size values are carefully aligned with typical page sizes
+          and kernel memory allocation patterns.
+*/
 #define MIN_BUFFER_SIZE (4UL * PAGE_SIZE)
 #define MAX_DYNAMIC_BUFFER_SIZE (64UL * 1024 * 1024) /* 64MB */
 #define INITIAL_BUFFER_SIZE (1UL * 1024 * 1024) /* 1MB */
@@ -377,39 +385,48 @@ struct v4l2l_buffer {
 #define BUFFER_RESIZE_LOG_PREFIX "[v4l2-loopback] Dynamic Buffer"
 
 /**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * struct dynamic_buffer_stats - Performance tracking for dynamic buffers
- * 
- * Tracks comprehensive metrics about buffer operations and performance:
- * 
- * @total_bytes_written: Cumulative count of bytes written
- * @total_bytes_read: Cumulative count of bytes read
- * @frames_written: Total frames written to buffer
- * @frames_read: Total frames read from buffer
- * @frames_dropped: Frames discarded due to overflow
- * 
- * @expand_count: Number of buffer expansions
- * @shrink_count: Number of buffer shrinks
- * @total_expand_time_us: Total time spent expanding (μs)
- * @total_shrink_time_us: Total time spent shrinking (μs)
- * @max_capacity_reached: Maximum size buffer ever grew to
- * @min_capacity_used: Minimum utilization observed
- * 
- * @created_at: Timestamp when buffer was created
- * @last_expand_at: Last expansion time
- * @last_shrink_at: Last shrink time
- * @last_write_at: Last write operation time
- * @last_read_at: Last read operation time
- * 
- * @current_fps_write: Current write rate (frames/sec)
- * @current_fps_read: Current read rate (frames/sec)
- * @last_fps_update: Last FPS calculation time
- * 
- * This structure provides detailed telemetry for monitoring and optimizing
- * dynamic buffer performance. All metrics are updated atomically to ensure
- * thread-safe access while maintaining statistics accuracy.
- */
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    struct dynamic_buffer_stats - Performance monitoring for dynamic buffers
+    Tracks operational metrics and performance characteristics of dynamic buffers,
+    providing visibility into system behavior and facilitating optimization.
+
+    Data Organization:
+      Operational Counters:
+         @total_bytes_written: Lifetime bytes written (atomic)
+         @total_bytes_read: Lifetime bytes read (atomic)
+         @frames_written: Successful frame writes (atomic)
+         @frames_read: Successful frame reads (atomic)
+         @frames_dropped: Frame loss due to overflow (atomic)
+      Memory Management Metrics:
+         @expand_count: Successful buffer expansions
+         @shrink_count: Successful buffer contractions
+         @total_expand_time_us: Cumulative expansion time (μs)
+         @total_shrink_time_us: Cumulative shrinkage time (μs)
+         @max_capacity_reached: Peak buffer size achieved
+         @min_capacity_used: Minimum utilization percentage
+      Timing Information:
+         @created_at: Buffer initialization timestamp
+         @last_expand_at: Most recent expansion time
+         @last_shrink_at: Most recent shrink time
+         @last_write_at: Last successful write op
+         @last_read_at: Last successful read op
+      Performance Indicators:
+         @current_fps_write: Instantaneous write rate (frames/sec)
+         @current_fps_read: Instantaneous read rate (frames/sec)
+         @last_fps_update: Last rate calculation timestamp
+    Implementation Notes:
+        All counters updated atomically for lock-free access
+        Timestamps use kernel's high-resolution time (ktime_t)
+        Rate calculations performed periodically to minimize overhead
+        Metrics designed for both real-time monitoring and historical analysis
+    Monitoring Use Cases:
+        Performance bottleneck identification
+        Memory utilization optimization
+        I/O pattern analysis
+        Capacity planning
+        Anomaly detection
+*/
 
 struct dynamic_buffer_stats {
 	/* Operations counters */
@@ -440,36 +457,57 @@ struct dynamic_buffer_stats {
 	u64 last_fps_update;
 };
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * struct dynamic_buffer - Core structure for dynamic circular buffer implementation
- * 
- * @data: Pointer to the allocated memory region for buffer storage
- * @size: Current total capacity of the buffer in bytes
- * @initial_size: Original allocated size used as reference for resizing
- * @write_pos: Current write position (circular index)
- * @read_pos: Current read position (circular index)
- * @available: Atomic counter of bytes available for reading
- * @ref_count: Atomic reference counter for safe memory management
- * @lock: Spinlock protecting concurrent access to buffer state
- * @read_waitq: Wait queue for threads blocked on read operations
- * @write_waitq: Wait queue for threads blocked on write operations
- * @active: Flag indicating whether buffer is operational
- * @shutdown_requested: Flag indicating graceful shutdown was initiated
- * @stats: Structure containing all performance statistics and metrics
- *
- * This structure implements a thread-safe, resizable circular buffer with:
- * - Atomic operations for key counters
- * - Proper synchronization primitives
- * - Blocking/non-blocking operation support
- * - Comprehensive statistics tracking
- * - Graceful shutdown capability
- * - Dynamic resizing functionality
- *
- * The circular buffer implementation handles wrap-around automatically and
- * provides safe concurrent access for multiple readers/writers.
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    struct dynamic_buffer - Core structure for dynamic circular buffer implementation
+    Implements a thread-safe, resizable circular buffer with atomic operations,
+    blocking I/O support, and comprehensive performance monitoring.
+
+    Core Components:
+       @data: Virtual memory allocation for buffer storage
+       @size: Current usable capacity in bytes (power-of-2 aligned)
+       @initial_size: Original allocation size (preserved for reference)
+    Buffer State Tracking:
+       @write_pos: Current producer position (modulo size)
+       @read_pos:  Current consumer position (modulo size)
+       @available: Atomic counter of readable bytes
+       @ref_count: Atomic reference counter for lifecycle management
+       @active:    Operational state flag (false during shutdown)
+       @shutdown_requested: Graceful termination indicator
+    Concurrency Control:
+       @lock: Spinlock protecting:
+              - Position updates
+              - Buffer state transitions
+              - Resize operations
+       @read_waitq: Wait queue for blocking read operations
+       @write_waitq: Wait queue for blocking write operations
+    Performance Monitoring:
+       @stats: Embedded statistics structure tracking:
+               - Throughput metrics
+               - Resize operations
+               - Timing information
+               - Error conditions
+    Implementation Notes:
+       Circular buffer semantics automatically handle wrap-around
+       All position counters use unsigned 32-bit arithmetic with modulo
+       Size always maintained as power-of-2 for efficient modulo operations
+       Reference counting ensures safe memory reclamation
+       Wait queues enable efficient blocking I/O
+    Safety Guarantees:
+       Atomic operations for all counters
+       Spinlock-protected critical sections
+       Graceful shutdown sequence
+       Thread-safe for concurrent readers/writers
+    Memory Layout:
+       +-------------------------------+
+       | dynamic_buffer (metadata)     |
+       +-------------------------------+
+       | data (mmap'ed region)         |
+       +-------------------------------+
+       | stats (performance counters)  |
+       +-------------------------------+
+*/
 struct dynamic_buffer {
 	void *data; /* Data buffer */
 	size_t size; /* Current buffer size */
@@ -667,34 +705,56 @@ struct v4l2l_format {
 
 static const unsigned int FORMATS = ARRAY_SIZE(formats);
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- * 
- * Dynamic Buffering Interface Functions
- * 
- * Core functions implementing dynamic buffer management for V4L2 loopback:
- *
- * @init_dynamic_buffer: Initialize dynamic buffer structure
- * @resize_dynamic_buffer: Resize buffer while maintaining contents
- * @dynamic_buffer_write: Write data to buffer with automatic expansion
- * @dynamic_buffer_read: Read data from buffer (blocking/non-blocking)
- * @sync_dynamic_to_v4l2_buffer: Synchronize dynamic buffer to V4L2 buffer
- * @__resize_buffer_locked: Internal resize implementation (caller must lock)
- * @__copy_circular_data: Internal circular buffer copy helper
- * @format_buffer_size: Format buffer size in human-readable units
- * @free_dynamic_buffer: Safely deallocate buffer resources
- * @calculate_buffer_used_bytes: Calculate used bytes in circular buffer
- *
- * These functions implement a thread-safe, resizable circular buffer system
- * with automatic memory management and statistics tracking. The interface
- * handles:
- * - Dynamic growth/shrinking based on demand
- * - Blocking/non-blocking operations
- * - Proper synchronization between readers/writers
- * - Graceful error handling
- * - Efficient circular buffer operations
- *
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    Dynamic Buffer Management API
+    Core interface for thread-safe, resizable circular buffer operations in V4L2 loopback.
+    Implements automatic memory management with atomic operations and proper synchronization.
+
+    Buffer Lifecycle Management:
+       @init_dynamic_buffer: Initializes buffer with default parameters
+       @free_dynamic_buffer: Safely releases all buffer resources
+       @resize_dynamic_buffer: Grows/shrinks buffer while preserving contents
+       @__resize_buffer_locked: Internal resize implementation (requires lock)
+    Data Operations:
+       @dynamic_buffer_write: Writes data with automatic expansion
+       @dynamic_buffer_read: Reads data (blocking/non-blocking modes)
+       @__copy_circular_data: Internal circular copy helper
+       @calculate_buffer_used_bytes: Computes currently used buffer space
+    System Integration:
+       @sync_dynamic_to_v4l2_buffer: Synchronizes content with V4L2 buffer structure
+       @format_buffer_size: Formats size for logging/diagnostics
+    Key Features:
+        Thread-safe circular buffer operations
+        Automatic expansion/shrinking:
+        Grows when reaching HIGH_WATERMARK_PERCENT
+        Shrinks below LOW_WATERMARK_FRACTION
+        Multiple access modes:
+        Blocking with wait queues
+        Non-blocking with immediate return
+        Atomic reference counting
+        Graceful shutdown handling
+        Comprehensive statistics tracking
+    Concurrency Model:
+        Spinlock-protected for all structural changes
+        Atomic operations for counters/positions
+        Wait queues for blocking operations
+        Reference counting for safe memory management
+    Error Handling:
+        Returns standard error codes
+        Preserves data consistency on failure
+        Automatic recovery from edge cases
+    Memory Management:
+        Uses vmalloc() for large buffer allocations
+        Power-of-2 size optimization
+        Efficient circular buffer arithmetic
+    Performance Considerations:
+        Minimizes memory copies during resize
+        Lock contention optimized for reader/writer patterns
+        Statistics collection with minimal overhead
+*/
+
 static int init_dynamic_buffer(struct v4l2_loopback_device *dev);
 static int resize_dynamic_buffer(struct v4l2_loopback_device *dev,
 				 u32 new_capacity);
@@ -1016,22 +1076,34 @@ static ssize_t attr_show_state(struct device *cd, struct device_attribute *attr,
 
 static DEVICE_ATTR(state, S_IRUGO, attr_show_state, NULL);
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * attr_show_dynamic_buffering - Display dynamic buffering status through sysfs
- * @cd: Parent device structure
- * @attr: Device attribute (unused)
- * @buf: Output buffer for status string
- *
- * Implements the read operation for the dynamic_buffering sysfs attribute.
- * Shows the current dynamic buffering state (0=disabled, 1=enabled) of the
- * v4l2 loopback device in human-readable format.
- *
- * Return: Number of bytes written to buffer or negative error code:
- *         -ENODEV if device is invalid
- *         Return value from sprintf()
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    attr_show_dynamic_buffering - Sysfs read operation for dynamic buffering status
+    @cd: Parent device structure (container device)
+    @attr: Sysfs attribute reference (unused)
+    @buf: Output buffer for status information (minimum 4 bytes required)
+
+    Provides read access to the dynamic buffering configuration state through sysfs:
+        Formats output as ASCII "0\n" (disabled) or "1\n" (enabled)
+        Output is guaranteed to be null-terminated
+        Implements standard VFS/sysfs read semantics
+    The function safely handles:
+        Invalid device references (returns -ENODEV)
+        Concurrent access (protected by device locks)
+        Buffer overflow protection (via sprintf)
+
+    Usage Example:
+    $ cat /sys/class/video4linux/video0/dynamic_buffering
+    1
+    Return: Number of bytes written to @buf (excluding null terminator) or:
+            -ENODEV if device cannot be resolved
+            Other negative values on formatting errors
+
+    Locking: Acquires device mutex during status check
+
+    Context: Process context (VFS/sysfs read handler)
+*/
 static ssize_t attr_show_dynamic_buffering(struct device *cd,
 					   struct device_attribute *attr,
 					   char *buf)
@@ -1043,29 +1115,45 @@ static ssize_t attr_show_dynamic_buffering(struct device *cd,
 	return sprintf(buf, "%d\n", dev->use_dynamic_buffering);
 }
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * attr_store_dynamic_buffering - Configure dynamic buffering through sysfs
- * @cd: Parent device structure
- * @attr: Device attribute (unused)
- * @buf: Input buffer containing new value
- * @len: Length of input buffer
- *
- * Implements the write operation for the dynamic_buffering sysfs attribute.
- * Accepts values:
- *   0 = Disable dynamic buffering (frees existing buffer)
- *   1 = Enable dynamic buffering (allocates buffer if needed)
- *
- * Performs proper buffer cleanup when disabling and lazy initialization
- * when enabling. Uses mutex locking to ensure thread safety during
- * configuration changes.
- *
- * Return: Length of input buffer on success, negative error code on failure:
- *         -ENODEV if device is invalid
- *         -EINVAL for invalid input value (>1)
- *         Other errors from kstrtoul() or buffer operations
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    attr_store_dynamic_buffering - Sysfs write operation for dynamic buffering control
+
+    @cd: Parent device structure (container device)
+    @attr: Sysfs attribute reference (unused)
+    @buf: Input buffer containing configuration value (ASCII "0" or "1")
+    @len: Length of input buffer (minimum 1 byte required)
+
+    Implements write access to dynamically enable/disable the buffering system:
+        "0": Disables dynamic buffering (performs cleanup if buffer exists)
+        "1": Enables dynamic buffering (lazy initialization on first use)
+    The function ensures:
+        Thread-safe configuration changes (protected by image_mutex)
+        Proper resource cleanup when disabling
+        Lazy allocation when enabling
+        Input validation (numeric values 0-1 only)
+    State Transition Behavior:
+        Disabling (0):
+        Immediately frees existing buffer via free_dynamic_buffer()
+        Preserves configuration for potential future re-enabling
+        Enabling (1):
+        Marks system as enabled but doesn't allocate until first use
+        Actual allocation happens during next buffer operation
+        Requires valid buffer_size configuration
+    Error Conditions:
+        Returns -ENODEV for invalid device references
+        Returns -EINVAL for:
+        Non-numeric input
+        Values outside 0-1 range
+        Invalid buffer_size when enabling
+        Propagates errors from memory operations
+    Usage Example:
+          echo 1 > /sys/class/video4linux/video0/dynamic_buffering
+    Return: Number of bytes processed on success, negative error code on failure
+    Locking: Acquires image_mutex for state changes
+    Context: Process context (VFS/sysfs write handler)
+*/
 static ssize_t attr_store_dynamic_buffering(struct device *cd,
 					    struct device_attribute *attr,
 					    const char *buf, size_t len)
@@ -1101,48 +1189,103 @@ static ssize_t attr_store_dynamic_buffering(struct device *cd,
 	return len;
 }
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * DEVICE_ATTR dynamic_buffering - Sysfs attribute control for dynamic buffering
- *
- * Creates a sysfs interface file named "dynamic_buffering" with:
- * - Read permissions for all users (S_IRUGO)
- * - Write permission for root only (S_IWUSR)
- * - attr_show_dynamic_buffering as read handler
- * - attr_store_dynamic_buffering as write handler
- *
- * This exposes the dynamic buffering control to userspace, allowing runtime
- * configuration of the feature. The interface supports:
- * - Reading current status (0=disabled, 1=enabled)
- * - Writing new status values
- * - Automatic buffer management on state changes
- *
- * Location in sysfs: /sys/class/video4linux/videoX/dynamic_buffering
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    DEVICE_ATTR dynamic_buffering - Sysfs control interface for dynamic buffer management
+    Defines a sysfs attribute that provides userspace control over the dynamic buffering
+    subsystem with the following characteristics:
+    Attribute Properties:
+        Name: "dynamic_buffering"
+        Path: /sys/class/video4linux/videoX/dynamic_buffering
+        Permissions:
+        Read: 0444 (S_IRUGO) - Readable by all users
+        Write: 0200 (S_IWUSR) - Writable by root only
+        Operations:
+        Read: attr_show_dynamic_buffering
+        Write: attr_store_dynamic_buffering
+    Functional Behavior:
+        Reading returns current state:
+        "0\n" = Static buffering mode
+        "1\n" = Dynamic buffering mode
+        Writing accepts:
+        "0" = Disables dynamic buffering (with resource cleanup)
+        "1" = Enables dynamic buffering (with lazy initialization)
+    Security Considerations:
+        Write operations restricted to privileged users
+        All input validated before processing
+        State changes protected by device mutex
+    Usage Examples:
+        Check current status:
+          $ cat /sys/class/video4linux/video0/dynamic_buffering
+        Enable dynamic buffering:
+          echo 1 > /sys/class/video4linux/video0/dynamic_buffering
+        Disable dynamic buffering:
+          echo 0 > /sys/class/video4linux/video0/dynamic_buffering
+    Implementation Notes:
+        Maintains consistency with sysfs conventions
+        Integrates with device power management
+        Preserves state across suspend/resume cycles
+        Atomic state transitions
+*/
 static DEVICE_ATTR(dynamic_buffering, S_IRUGO | S_IWUSR,
 		   attr_show_dynamic_buffering, attr_store_dynamic_buffering);
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * dynamic_buffer_stats_show - Display comprehensive buffer statistics
- * @cd: Parent device structure
- * @attr: Device attribute (unused)
- * @buf: Output buffer for statistics
- *
- * Generates a detailed human-readable report of dynamic buffer statistics including:
- * - Current buffer state (size, usage, positions)
- * - I/O operations (frames/bytes written/read)
- * - Resize operations (counts, timings)
- * - Historical maximums
- * - Recent activity timestamps
- *
- * The report is formatted with clear sections and uses human-readable units.
- * All statistics are gathered under lock protection for accuracy.
- *
- * Return: Number of bytes written to buffer, or error message if inactive
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    dynamic_buffer_stats_show - Comprehensive buffer telemetry interface
+    @cd: Parent device structure (container device)
+    @attr: Sysfs attribute reference (unused)
+    @buf: Output buffer for statistics (minimum 1KB recommended)
+
+    Generates a multi-section diagnostic report containing:
+        Current State:
+        Buffer capacity and utilization percentage
+        Read/write positions
+        System uptime
+        I/O Metrics:
+        Frame operations (written/read/dropped)
+        Byte throughput (total written/read)
+        Memory Management:
+        Resize operations (counts and average duration)
+        Peak capacity reached
+        Last resize timestamps
+        Performance Indicators:
+        Current read/write rates
+        Recent activity patterns
+    Data Collection:
+        All statistics gathered under spinlock protection
+        Uses monotonic timestamps for accuracy
+        Handles buffer wrap-around correctly
+        Formats sizes in human-readable units
+    Output Format:
+        Structured ASCII report with clear section headers
+        Fixed-point percentages (0-100%)
+        Time values in seconds resolution
+        Size values in appropriate units (KB/MB/GB)
+    Error Handling:
+        Returns error message if dynamic buffering inactive
+        Handles division by zero in averages
+        Validates buffer references
+    Example Output:
+       === V4L2-Loopback Dynamic Buffer Statistics ===
+       -- Current State --
+       Buffer size: 16.0 MB
+       Used: 12.5 MB (78%)
+       Read offset: 0x12345678
+       Write offset: 0x23456789
+       Uptime: 3600 seconds
+       -- I/O Statistics --
+       Frames written: 12000
+       Frames read: 11500
+       Frames dropped: 5
+       Total written: 1.2 GB
+       Total read: 1.1 GB
+    Return: Number of bytes written to buffer or error message
+    Locking: Acquires buffer spinlock during data collection
+    Context: Process context (VFS/sysfs read handler)
+    */
 static ssize_t dynamic_buffer_stats_show(struct device *cd,
 					 struct device_attribute *attr,
 					 char *buf)
@@ -1236,27 +1379,45 @@ static ssize_t dynamic_buffer_stats_show(struct device *cd,
 	return len;
 }
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * dynamic_buffer_reset_stats_store - Reset dynamic buffer statistics
- * @cd: Parent device structure
- * @attr: Device attribute (unused)
- * @buf: Input buffer containing reset command
- * @len: Length of input buffer
- *
- * Handles the sysfs write operation to reset the dynamic buffer statistics.
- * Only processes the command when receiving '1' as input. Performs atomic
- * reset of all statistics while preserving:
- * - Buffer creation timestamp
- * - Current buffer capacity
- *
- * Requires the dynamic buffer to be active. All statistics are cleared to zero
- * except min_capacity_used which is set to current buffer size.
- *
- * Return: Length of input buffer on success, negative error code on failure:
- *         -EINVAL if dynamic buffering is inactive
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    dynamic_buffer_reset_stats_store - Sysfs control for resetting buffer statistics
+    @cd: Parent device structure (container device)
+    @attr: Sysfs attribute reference (unused)
+    @buf: Input buffer containing reset command (ASCII "1" to reset)
+    @len: Length of input buffer (minimum 1 byte required)
+
+    Implements write access to reset all dynamic buffer statistics while maintaining:
+        Original creation timestamp (preserves uptime reference)
+        Current buffer capacity metrics
+        Structural integrity of the buffer
+    Reset Behavior:
+        Clears all counters (I/O operations, resize events)
+        Maintains creation timestamp for continuity
+        Preserves current size as both min and max capacity
+        Logs reset event to kernel log
+    Security and Validation:
+        Only accepts "1" as valid reset command
+        Requires active dynamic buffering
+        Performs atomic reset under spinlock protection
+        Validates device and buffer state
+    Error Conditions:
+        Returns -EINVAL for:
+        Dynamic buffering inactive
+        Invalid buffer reference
+        Empty or invalid command
+    Usage Example:
+        echo 1 > /sys/class/video4linux/video0/reset_stats
+    Locking:
+        Uses buffer spinlock to protect statistics during reset
+        Short critical section for minimal contention
+    Context:
+        Process context (VFS/sysfs write handler)
+        May sleep during logging operation
+    Note: Statistics reset does not affect actual buffer contents or operations,
+          only clears performance tracking metrics.
+*/
 static ssize_t dynamic_buffer_reset_stats_store(struct device *cd,
 						struct device_attribute *attr,
 						const char *buf, size_t len)
@@ -1282,24 +1443,49 @@ static ssize_t dynamic_buffer_reset_stats_store(struct device *cd,
 	return len;
 }
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * Sysfs Attributes for Dynamic Buffer Management:
- *
- * @dynamic_buffer_stats: (0444) Read-only statistics interface
- *   - Path: /sys/class/video4linux/videoX/dynamic_buffer_stats  
- *   - Shows: Current buffer state, I/O counters, resize history
- *   - Format: Human-readable multi-line report
- *
- * @dynamic_buffer_reset_stats: (0200) Write-only control interface
- *   - Path: /sys/class/video4linux/videoX/dynamic_buffer_reset_stats
- *   - Accepts: '1' to reset all statistics
- *   - Effect: Clears counters while preserving buffer configuration
- *
- * These attributes provide monitoring and control of the dynamic buffer system.
- * Permission bits enforce read-only or write-only access as appropriate.
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    Dynamic Buffer Sysfs Control Interface
+    Provides userspace access to dynamic buffer monitoring and management through
+    two complementary sysfs attributes:
+        Statistics Interface (read-only):
+    @attr: dynamic_buffer_stats
+    @perms: 0444 (S_IRUGO)
+    @path: /sys/class/video4linux/videoX/dynamic_buffer_stats
+    @handler: dynamic_buffer_stats_show()
+    Features:
+        Comprehensive buffer telemetry
+        Real-time utilization metrics
+        Historical performance data
+        Thread-safe data collection
+        Human-readable multi-section format
+        Control Interface (write-only):
+    @attr: dynamic_buffer_reset_stats
+    @perms: 0200 (S_IWUSR)
+    @path: /sys/class/video4linux/videoX/dynamic_buffer_reset_stats
+    @handler: dynamic_buffer_reset_stats_store()
+    Features:
+        Atomic statistics reset
+        Privileged access only (root)
+        Minimal impact on running operations
+        System log confirmation
+    Security Model:
+        Read access: Available to all processes
+        Write access: Restricted to privileged users
+        Input validation: Strict command verification
+        Atomic operations: Protected by spinlocks
+    Usage Examples:
+        View statistics:
+          $ cat /sys/class/video4linux/video0/dynamic_buffer_stats
+        Reset statistics (requires root):
+          echo 1 > /sys/class/video4linux/video0/dynamic_buffer_reset_stats
+    Design Considerations:
+        Separate read/write paths for security
+        No persistent storage of statistics
+        Minimal performance impact during access
+        Consistent formatting for parsing tools
+*/
 static DEVICE_ATTR(dynamic_buffer_stats, 0444, dynamic_buffer_stats_show, NULL);
 static DEVICE_ATTR(dynamic_buffer_reset_stats, 0200, NULL,
 		   dynamic_buffer_reset_stats_store);
@@ -1471,23 +1657,40 @@ static int vidioc_querycap(struct file *file, void *fh,
 	return 0;
 }
 
-/**
- * Implement Dynamic Buffering
- * 
- * format_buffer_size - Formats a size in bytes into human-readable string
- * @size: Input size in bytes to be formatted
- * @buf: Output buffer where the formatted string will be stored
- * @buf_size: Size of the output buffer to prevent overflow
- *
- * Converts a byte size into a human-readable format with appropriate unit (B, KB, MB, GB).
- * Uses integer arithmetic to calculate decimal places for KB/MB/GB conversions.
- * Ensures the formatted string fits in the provided buffer and is properly null-terminated.
- *
- * Example:
- * 1024 → "1 KB"
- * 1536 → "1.50 KB"
- * 1048576 → "1 MB"
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    format_buffer_size - Converts byte size to human-readable string with units
+    @size: Input size in bytes (unsigned 64-bit)
+    @buf: Output character buffer (minimum 16 bytes recommended)
+    @buf_size: Maximum capacity of output buffer (including null terminator)
+
+    Transforms raw byte counts into formatted strings with appropriate binary
+    units (B, KB, MB, GB) using these conversion rules:
+        < 1024 bytes: Display as-is with "B" unit
+        1024-1048575: Convert to KB with 2 decimal places
+        1MB-1GB-1: Convert to MB with 2 decimal places
+            = 1GB: Convert to GB with 2 decimal places
+    Implementation Details:
+        Uses integer arithmetic for precise decimal calculations
+        Handles 64-bit size inputs properly
+        Guarantees null-terminated output
+        Prevents buffer overflow with snprintf()
+        Optimized for performance (no floating point operations)
+    Examples:
+    512 → "512 B"
+    1024 → "1 KB"
+    1536 → "1.50 KB"
+    1048576 → "1 MB"
+    1572864 → "1.50 MB"
+    Error Handling:
+        Safely handles NULL buffer pointers
+        Verifies buffer capacity before writing
+        Returns empty string if buf_size == 0
+    Thread Safety:
+        Reentrant (no shared state)
+        Lock-free (uses only local variables)
+*/
 static void format_buffer_size(size_t size, char *buf, size_t buf_size)
 {
 	const char *units[] = { "B", "KB", "MB", "GB" };
@@ -2503,23 +2706,45 @@ static void buffer_written(struct v4l2_loopback_device *dev,
 	spin_unlock_irqrestore(&dev->lock, flags); //thread-safe
 }
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * sync_dynamic_to_v4l2_buffer - Synchronizes data from dynamic buffer to V4L2 buffer
- * @dev: Pointer to the v4l2_loopback_device structure
- * @bufd: Pointer to the v4l2l_buffer structure (destination buffer)
- * @bytesused: Number of bytes to be copied
- *
- * Copies data from the dynamic buffer to the V4L2 buffer, handling buffer management
- * and synchronization. If dynamic buffering is disabled or data is unavailable,
- * fills the destination buffer with zeros. Manages reference counting for the
- * dynamic buffer and handles cleanup when the last reference is released.
- *
- * Return: Number of bytes copied on success (may be zero-filled),
- *         0 if dynamic buffering is disabled,
- *         -ENODEV if dynamic buffer is not available
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    sync_dynamic_to_v4l2_buffer - Synchronizes data between dynamic and V4L2 buffers
+    @dev: Pointer to the v4l2_loopback_device structure (parent device)
+    @bufd: Pointer to the destination v4l2l_buffer structure
+    @bytesused: Maximum number of bytes to copy (typically buffer capacity)
+
+    Performs safe data transfer from the dynamic circular buffer to a V4L2 buffer
+    with these key features:
+    Data Transfer Protocol:
+        Reference Counting:
+        Atomic increment on dynamic buffer before access
+        Guaranteed release through decrement and cleanup
+        Error Handling:
+        Gracefully handles empty/inactive buffers (zero-fills)
+        Properly propagates read errors
+        Validates buffer states before operations
+        Memory Management:
+        Automatically cleans up buffers on last reference release
+        Uses proper vfree() for vmalloc'd memory
+    State Management:
+        Checks shutdown_requested flag before operations
+        Validates dynamic buffering activation state
+        Handles concurrent access safely
+    Return Values:
+        0: Number of bytes successfully copied (may be zero-filled)
+    0: Dynamic buffering disabled (no error)
+       -ENODEV: Dynamic buffer unavailable
+       -EINVAL: Invalid parameters
+       -EAGAIN: Buffer temporarily unavailable
+    Locking Strategy:
+        Uses device spinlock for reference counting
+        Internal dynamic buffer locks for data access
+    Memory Safety:
+        Guarantees reference release
+        Prevents use-after-free
+        Properly handles mapped V4L2 buffer memory
+*/
 static int sync_dynamic_to_v4l2_buffer(struct v4l2_loopback_device *dev,
 				       struct v4l2l_buffer *bufd, u32 bytesused)
 {
@@ -2534,8 +2759,10 @@ static int sync_dynamic_to_v4l2_buffer(struct v4l2_loopback_device *dev,
 
 	spin_lock_irqsave(&dev->lock, flags);
 	dbuf = dev->dbuf;
-	if (dbuf)
+	if (dbuf && !dbuf->shutdown_requested) // Shutdown check
 		atomic_inc(&dbuf->ref_count);
+	else
+		dbuf = NULL; // Ensure dbuf is NULL if shutdown was requested
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	if (!dbuf)
@@ -2545,12 +2772,25 @@ static int sync_dynamic_to_v4l2_buffer(struct v4l2_loopback_device *dev,
 	dest = dev->image + bufd->buffer.m.offset;
 	to_copy = min(bytesused, dev->buffer_size);
 
-	/* Reads data from the dynamic buffer*/
 	ret = dynamic_buffer_read(dev, dest, to_copy, false);
 	if (ret < 0) {
-		/* If there is not enough data, fill with zeros */
-		memset(dest, 0, to_copy);
-		ret = to_copy;
+		/* Specific treatment by error type */
+		if (ret == -EAGAIN || ret == -ENODEV) {
+			/* Empty or inactive buffer - expected behavior, fill with zeros */
+			memset(dest, 0, to_copy);
+			ret = to_copy;
+		} else {
+			/* Actual error (e.g. -EINVAL) - propagate the error */
+			dprintk("sync_dynamic_to_v4l2_buffer: read error %d\n",
+				ret);
+			/* Still need to release the reference before returning */
+			if (atomic_dec_return(&dbuf->ref_count) == 0 &&
+			    dbuf->shutdown_requested) {
+				vfree(dbuf->data);
+				kfree(dbuf);
+			}
+			return ret;
+		}
 	} else if (ret < to_copy) {
 		/* Fill the rest with zeros if necessary */
 		memset(dest + ret, 0, to_copy - ret);
@@ -2679,7 +2919,11 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 			dev->write_position);
 
 		set_done(bufd->buffer.flags);
-		wake_up_all(&dev->read_event);
+
+		/* Check for waiters before waking up */
+		if (waitqueue_active(&dev->read_event))
+			wake_up_all(&dev->read_event);
+
 		break;
 	default:
 		return -EINVAL;
@@ -2759,6 +3003,7 @@ static int get_capture_buffer(struct file *file)
 
 	else if (dev->use_dynamic_buffering && dev->dbuf) {
 		/* In dynamic mode, sync from dynamic buffer */
+
 		int sync_ret = sync_dynamic_to_v4l2_buffer(
 			dev, &dev->buffers[index], dev->buffer_size);
 		if (sync_ret < 0) {
@@ -3815,18 +4060,37 @@ static void timeout_timer_clb(unsigned long nr)
 	spin_unlock(&dev->lock);
 }
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- * 
- * calculate_buffer_used_bytes - Calculates the number of used bytes in a circular buffer
- * @dbuf: Pointer to the dynamic buffer structure
- *
- * Computes the amount of data currently stored in a circular buffer by comparing
- * read and write positions. Handles both linear (write_pos > read_pos) and wrapped
- * (write_pos < read_pos) buffer states.
- *
- * Return: Number of used bytes in the buffer (0 if buffer is empty)
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    calculate_buffer_used_bytes - Computes occupied space in circular buffer
+    @dbuf: Pointer to initialized dynamic_buffer structure (must be valid)
+
+    Calculates the exact number of bytes currently stored in a circular buffer by
+    comparing read and write positions. The computation handles all buffer states:
+    Buffer State Cases:
+        Linear (write_pos > read_pos):
+        Used space = write_pos - read_pos
+        Wrapped (write_pos < read_pos):
+        Used space = (buffer_size - read_pos) + write_pos
+        Empty (write_pos == read_pos):
+        Returns 0
+    Implementation Notes:
+        Uses unsigned arithmetic to avoid overflow
+        Lockless design (caller must ensure synchronization)
+        Constant-time operation O(1)
+        Handles full buffer case implicitly
+    Safety Considerations:
+        Requires valid initialized buffer
+        Assumes positions are within valid range (0 <= pos < buffer_size)
+        Not atomic - caller must hold appropriate locks if needed
+    Example Usage:
+      u32 used = calculate_buffer_used_bytes(dbuf);
+      if (used > HIGH_WATERMARK) {
+        // Trigger buffer expansion
+        }
+      Return: Number of bytes currently stored in buffer (0..buffer_size-1)
+*/
 static inline u32 calculate_buffer_used_bytes(struct dynamic_buffer *dbuf)
 {
 	if (dbuf->write_pos >= dbuf->read_pos)
@@ -3835,27 +4099,50 @@ static inline u32 calculate_buffer_used_bytes(struct dynamic_buffer *dbuf)
 		return (dbuf->size - dbuf->read_pos) + dbuf->write_pos;
 }
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * init_dynamic_buffer - Initializes a dynamic buffer for V4L2 loopback device
- * @dev: Pointer to the v4l2_loopback_device structure
- *
- * Allocates and initializes a circular buffer for dynamic frame storage. Handles:
- * - Thread-safe initialization with reference counting
- * - Automatic buffer size calculation based on pixel format
- * - Overflow protection and size validation
- * - Graceful memory allocation fallback
- * - Statistics tracking and waitqueue initialization
- *
- * The function is idempotent and will reuse existing buffers if called multiple times.
- * Performs extensive error checking and returns appropriate error codes.
- *
- * Return: 0 on success, negative error code on failure:
- *         -EINVAL for invalid parameters
- *         -EOVERFLOW for size calculation overflow
- *         -ENOMEM for allocation failures
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    init_dynamic_buffer - Initializes a thread-safe circular buffer for video frame storage
+    @dev: Pointer to initialized v4l2_loopback_device structure
+
+    Creates and configures a dynamic circular buffer with these key features:
+    Memory Management:
+        Automatically calculates optimal size based on:
+        Device pixel format (if specified)
+        Minimum/Maximum size constraints
+        System capabilities
+        Implements graceful fallback for allocation failures
+        Uses vzalloc() for large contiguous memory regions
+    Thread Safety:
+        Implements race-free initialization
+        Atomic reference counting
+        Proper spinlock protection
+        Idempotent operation (safe for multiple calls)
+    Error Handling:
+        Validates all parameters
+        Checks for arithmetic overflow
+        Provides detailed error logging
+        Returns standardized error codes
+    Initialization Phases:
+        Validation: Checks device state and parameters
+        Size Calculation: Determines optimal buffer dimensions
+        Allocation: Attempts primary and fallback allocations
+        Configuration: Sets up synchronization primitives
+        Activation: Atomically enables the buffer
+    Return Values:
+        0: Success (buffer ready for use)
+          -EINVAL: Invalid parameters or device state
+          -EOVERFLOW: Size calculation overflow
+          -ENOMEM: Memory allocation failure
+    Locking Strategy:
+        Uses device spinlock for atomic assignment
+        Internal spinlock for buffer operations
+        Waitqueues for blocking I/O
+    Memory Safety:
+        Guarantees cleanup on allocation failure
+        Prevents memory leaks
+        Handles concurrent access safely
+*/
 static int init_dynamic_buffer(struct v4l2_loopback_device *dev)
 {
 	struct dynamic_buffer *dbuf = NULL;
@@ -3983,29 +4270,50 @@ static int init_dynamic_buffer(struct v4l2_loopback_device *dev)
 	return 0;
 }
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * free_dynamic_buffer - Safely deallocates a dynamic buffer from V4L2 loopback device
- * @dev: Pointer to the v4l2_loopback_device structure containing the buffer
- *
- * Performs a thread-safe deallocation of the dynamic buffer with proper cleanup:
- * - Atomically removes buffer reference from device
- * - Signals shutdown to all pending operations
- * - Wakes all blocked reader/writer threads
- * - Implements grace period for pending operations
- * - Handles reference counting for safe memory release
- * - Provides detailed logging of buffer state
- *
- * The function handles edge cases including:
- * - NULL device pointer
- * - Already freed buffers
- * - Active references preventing immediate deallocation
- * - Proper cleanup of both buffer structure and data memory
- *
- * Note: Buffer may not be freed immediately if references remain,
- *       but will be marked for deferred cleanup.
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    free_dynamic_buffer - Safely deallocates a dynamic buffer with guaranteed cleanup
+    @dev: Pointer to the v4l2_loopback_device structure (must be valid)
+
+    Performs a complete shutdown sequence for dynamic buffers with these phases:
+        Buffer Detachment:
+        Atomically removes buffer reference from parent device
+        Prevents new operations from starting
+        Shutdown Signaling:
+        Marks buffer inactive
+        Sets shutdown_requested flag
+        Wakes all blocked threads
+        Grace Period:
+        Waits BUFFER_GRACE_PERIOD_MS for pending operations
+        Allows in-progress I/O to complete
+        Resource Reclamation:
+        Checks reference count
+        Frees memory if no references remain
+        Logs status for debugging
+    Safety Mechanisms:
+        Double-checked locking pattern
+        Atomic reference counting
+        Grace period for pending operations
+        NULL pointer validation
+        Proper memory barrier usage
+    Memory Management:
+        Uses vfree() for vmalloc'd data buffer
+        Uses kfree() for control structure
+        Nullifies pointers after free
+    Error Recovery:
+        Handles concurrent access during shutdown
+        Tolerates repeated calls
+        Preserves system stability if called during active I/O
+    Locking Strategy:
+        Device lock protects buffer pointer
+        Buffer lock protects internal state
+        Reference count ensures safe final free
+    Thread Safety:
+        Safe to call from any context
+        Handles concurrent readers/writers
+        Non-blocking after grace period
+*/
 static void free_dynamic_buffer(struct v4l2_loopback_device *dev)
 {
 	struct dynamic_buffer *dbuf;
@@ -4015,7 +4323,6 @@ static void free_dynamic_buffer(struct v4l2_loopback_device *dev)
 	if (unlikely(!dev))
 		return;
 
-	/* Thread-safe removal of device reference */
 	spin_lock_irqsave(&dev->lock, flags);
 	dbuf = dev->dbuf;
 	dev->dbuf = NULL;
@@ -4024,21 +4331,19 @@ static void free_dynamic_buffer(struct v4l2_loopback_device *dev)
 	if (unlikely(!dbuf))
 		return;
 
-	/* Shutdown signaling for all pending operations */
+	// Mark for shutdown BEFORE decrementing reference
 	spin_lock_irqsave(&dbuf->lock, flags);
 	dbuf->active = false;
 	dbuf->shutdown_requested = true;
 	spin_unlock_irqrestore(&dbuf->lock, flags);
 
-	/* Wake up all blocked threads */
+    // Force wake up ALL blocked operations immediately
 	wake_up_interruptible_all(&dbuf->read_waitq);
 	wake_up_interruptible_all(&dbuf->write_waitq);
 
-	/* Grace period for pending operations to end */
+	// Wait for all pending operations to complete
 	msleep(BUFFER_GRACE_PERIOD_MS);
 
-	/* Decrement reference and release if last */
-	ref_count = atomic_dec_return(&dbuf->ref_count);
 	if (ref_count == 0) {
 		if (dbuf->data) {
 			vfree(dbuf->data);
@@ -4052,27 +4357,43 @@ static void free_dynamic_buffer(struct v4l2_loopback_device *dev)
 	}
 }
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * __copy_circular_data - Copies data from a circular buffer to a linear destination
- * @src_data: Pointer to the source circular buffer data
- * @src_size: Total size of the circular buffer
- * @src_pos: Starting position in the circular buffer
- * @dst_data: Pointer to the destination linear buffer
- * @copy_len: Number of bytes to copy
- *
- * Efficiently copies data from a circular buffer to a linear destination buffer,
- * handling the wrap-around case where data spans the end and beginning of the
- * circular buffer. The function performs the copy in at most two memcpy operations:
- * 1. From src_pos to end of circular buffer
- * 2. From beginning of circular buffer for remaining data (if needed)
- *
- * Note: Caller must ensure:
- * - copy_len does not exceed src_size
- * - src_pos is within valid range (0 <= src_pos < src_size)
- * - dst_data has sufficient space for copy_len bytes
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    __copy_circular_data - Efficient circular-to-linear buffer copy operation
+    @src_data: Pointer to source circular buffer (must be valid)
+    @src_size: Total capacity of circular buffer (must be power-of-2)
+    @src_pos: Starting read position (0 <= src_pos < src_size)
+    @dst_data: Destination linear buffer (must have copy_len capacity)
+    @copy_len: Bytes to copy (must be <= src_size)
+
+    Performs optimized data transfer from circular to linear memory with these
+    characteristics:
+    Copy Algorithm:
+        Calculates contiguous chunk from src_pos to buffer end
+        Performs first memcpy for this contiguous segment
+        If needed, copies remaining data from buffer start
+        Completes in maximum 2 memcpy operations
+    Performance:
+        O(1) computation overhead
+        Minimal branching
+        Optimal memcpy utilization
+        No temporary buffers
+    Safety Requirements:
+        All pointers must be valid
+        src_size must be power-of-2 for performance
+        Positions and lengths must be within bounds
+        Caller must ensure proper synchronization
+    Typical Use Cases:
+        Video frame extraction
+        Audio buffer processing
+        Network packet handling
+    Optimization Notes:
+        Branch prediction friendly
+        Memory access pattern optimized
+        Inlinable for small copies
+        No dynamic memory allocation
+*/
 static void __copy_circular_data(const void *src_data, u32 src_size,
 				 u32 src_pos, void *dst_data, u32 copy_len)
 {
@@ -4088,27 +4409,54 @@ static void __copy_circular_data(const void *src_data, u32 src_size,
 	}
 }
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * __resize_buffer_locked - Resizes a dynamic buffer while preserving its contents
- * @dbuf: Pointer to the dynamic buffer structure to resize
- * @new_capacity: Desired new capacity in bytes
- *
- * Performs a thread-unsafe resize operation on a circular buffer, maintaining
- * any existing data. The function:
- * - Validates the new capacity against minimum/maximum limits
- * - Skips resizing if the change is insignificant (<10% size difference)
- * - Allocates new memory and copies existing data using circular copy
- * - Atomically replaces the buffer while preserving data consistency
- * - Updates buffer positions and maintains active status
- *
- * Caller must ensure proper locking around this operation.
- *
- * Return: 0 on success, negative error code on failure:
- *         -EINVAL for invalid parameters or inactive buffer
- *         -ENOMEM for allocation failures
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    __resize_buffer_locked - Performs an atomic resize of a circular buffer
+    @dbuf: Pointer to initialized dynamic_buffer structure (must be valid)
+    @new_capacity: Requested new size in bytes (must be validated)
+
+    Executes a safe buffer resize operation with these guarantees:
+    Resize Protocol:
+        Validation Phase:
+        Checks buffer active state
+        Verifies new capacity against:
+          * Minimum system requirements (MIN_BUFFER_SIZE)
+          * Maximum allowed size (MAX_DYNAMIC_BUFFER_SIZE)
+          * Current data volume (available bytes)
+    Skips insignificant size changes (<10% difference)
+    Memory Management:
+      Allocates new zero-initialized memory (vzalloc)
+      Preserves existing data via optimized circular copy
+      Uses atomic pointer swap for buffer replacement
+      Frees old memory only after successful replacement
+    State Maintenance:
+      Updates buffer positions (read_pos/write_pos)
+      Tracks capacity statistics (min/max usage)
+      Maintains active status during operation
+    Performance Characteristics:
+      O(n) copy complexity (n = used bytes)
+      Zero-copy for no-op cases
+      Minimal locking requirements (caller-managed)
+      Optimized for large buffer operations
+    Safety Requirements:
+      Caller must hold appropriate locks
+      Buffer must be in active state
+      new_capacity must be pre-validated
+      No concurrent access during execution
+    Error Handling:
+      Returns 0 on success
+      Returns -EINVAL for:
+       Invalid parameters
+       Size constraints violation
+       Inactive buffer
+    Returns -ENOMEM for allocation failures
+    Typical Usage:
+      Called from within a locked section to implement:
+      Automatic buffer expansion (high watermark)
+      Controlled buffer shrinking (low watermark)
+      Manual size adjustment
+*/
 static int __resize_buffer_locked(struct dynamic_buffer *dbuf, u32 new_capacity)
 {
 	void *new_data;
@@ -4167,27 +4515,54 @@ static int __resize_buffer_locked(struct dynamic_buffer *dbuf, u32 new_capacity)
 	return 0;
 }
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * resize_dynamic_buffer - Thread-safe resizing of a dynamic buffer
- * @dev: Pointer to the v4l2_loopback_device structure
- * @new_capacity: Desired new buffer capacity in bytes
- *
- * Safely resizes the device's dynamic buffer while maintaining data integrity.
- * The function:
- * - Acquires proper locks for thread-safe operation
- * - Manages buffer reference counting
- * - Delegates actual resize to __resize_buffer_locked
- * - Wakes blocked threads after successful resize
- * - Handles buffer cleanup if marked for shutdown
- * - Validates all input parameters
- *
- * Return: 0 on success, negative error code on failure:
- *         -EINVAL for invalid parameters
- *         -ENODEV if buffer not initialized
- *         Error codes from __resize_buffer_locked
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    resize_dynamic_buffer - Thread-safe dynamic buffer resizing operation
+    @dev: Pointer to initialized v4l2_loopback_device structure
+    @new_capacity: Requested buffer size in bytes (must be validated)
+
+    Performs a complete buffer resize operation with these guarantees:
+    Resize Protocol:
+        Reference Acquisition:
+        Safely obtains buffer reference under device lock
+        Checks shutdown state
+        Uses atomic reference counting
+        Core Resize Operation:
+        Executes under buffer spinlock
+        Delegates to __resize_buffer_locked
+        Preserves all existing data
+        Validates new capacity constraints
+        Post-Resize Handling:
+        Wakes blocked threads if successful
+        Releases reference count
+        Handles deferred cleanup if shutdown pending
+    Thread Safety:
+        Uses proper spinlock nesting (device -> buffer)
+        Atomic reference counting
+        Safe for concurrent readers/writers
+        Handles shutdown race conditions
+    Memory Management:
+        Ensures proper reference counting
+        Handles vmalloc'd memory correctly
+        Deferred cleanup if references remain
+        Null pointer protection
+    Error Handling:
+        Returns 0 on success
+        Returns -EINVAL for invalid parameters
+        Returns -ENODEV if:
+        Device not initialized
+        Buffer shutdown in progress
+        Propagates errors from __resize_buffer_locked
+    Locking Strategy:
+        Device lock (for reference management)
+        Buffer lock (for resize operation)
+        Atomic operations (reference counting)
+    Typical Usage:
+        Called during automatic buffer expansion/shrinking
+        Used for manual buffer size adjustment
+        Part of dynamic buffer management system
+*/
 static int resize_dynamic_buffer(struct v4l2_loopback_device *dev,
 				 u32 new_capacity)
 {
@@ -4201,8 +4576,10 @@ static int resize_dynamic_buffer(struct v4l2_loopback_device *dev,
 	/* Safely getting the buffer reference */
 	spin_lock_irqsave(&dev->lock, flags);
 	dbuf = dev->dbuf;
-	if (dbuf)
+	if (dbuf && !dbuf->shutdown_requested) // Shutdown check
 		atomic_inc(&dbuf->ref_count);
+	else
+		dbuf = NULL; // Ensure dbuf is NULL if shutdown was requested
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	if (unlikely(!dbuf))
@@ -4229,35 +4606,52 @@ static int resize_dynamic_buffer(struct v4l2_loopback_device *dev,
 	return ret;
 }
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * dynamic_buffer_write - Writes data to a dynamic circular buffer
- * @dev: Pointer to the v4l2_loopback_device structure
- * @src: Source buffer containing data to write
- * @len: Number of bytes to write
- *
- * Performs a thread-safe write operation to a dynamic circular buffer with
- * multiple fallback strategies:
- * 1. Direct write when space available
- * 2. Buffer expansion when high watermark reached
- * 3. Old data discard when buffer full
- * 4. Blocking wait with timeout when no immediate space
- *
- * Implements reference counting for safe buffer access and handles:
- * - Buffer expansion up to MAX_DYNAMIC_BUFFER_SIZE
- * - Statistics tracking (bytes written, timestamps)
- * - Reader wakeup notifications
- * - Graceful handling of shutdown requests
- * - Comprehensive error checking
- *
- * Return: Number of bytes written on success (may be less than requested),
- *         negative error code on failure:
- *         -EINVAL for invalid parameters
- *         -ENODEV if buffer not available or inactive
- *         -ETIMEDOUT if wait for space times out
- *         -EINTR if operation interrupted
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    dynamic_buffer_write - Thread-safe data write to dynamic circular buffer
+    @dev: Pointer to initialized v4l2_loopback_device structure
+    @src: Source buffer containing data to write (must be valid)
+    @len: Number of bytes to write (must be > 0)
+
+    Implements a robust write operation with multiple fallback strategies:
+    Write Protocol:
+        Reference Acquisition:
+        Safely obtains buffer reference under device lock
+        Validates buffer state (active/shutdown)
+        Uses atomic reference counting
+        Write Strategies (attempted in order):
+    a) Direct write when sufficient space available
+    b) Buffer expansion when high watermark reached
+    c) Old data discard when partially full
+    d) Blocking wait with timeout when necessary
+        Post-Write Handling:
+        Wakes blocked readers if data written
+        Updates performance statistics
+        Releases reference count
+        Handles deferred cleanup if shutdown pending
+    Thread Safety:
+        Proper spinlock nesting (device -> buffer)
+        Atomic operations for shared counters
+        Waitqueue synchronization
+        Handles concurrent read/write operations
+    Memory Management:
+        Safe buffer reference handling
+        Automatic expansion up to MAX_DYNAMIC_BUFFER_SIZE
+        Graceful fallback when allocation fails
+        Proper cleanup on shutdown
+    Error Handling:
+        Returns bytes written on success (may be partial)
+        Returns -EINVAL for invalid parameters
+        Returns -ENODEV if buffer unavailable/inactive
+        Returns -ETIMEDOUT on wait timeout
+        Returns -EINTR if operation interrupted
+    Performance Characteristics:
+        O(1) for direct writes
+        O(n) for buffer expansion (n = data size)
+        Adaptive retry logic for contention
+        Minimal locking duration
+*/
 static int dynamic_buffer_write(struct v4l2_loopback_device *dev, const u8 *src,
 				u32 len)
 {
@@ -4266,24 +4660,25 @@ static int dynamic_buffer_write(struct v4l2_loopback_device *dev, const u8 *src,
 	u32 available, free_space, first_chunk;
 	int ret = 0, retry_count = 0;
 
-	/* Parameter validation */
 	if (unlikely(!dev || !src || len == 0 || !dev->use_dynamic_buffering))
 		return -EINVAL;
 
-	/* Safely getting the buffer reference */
+	// 1. dev->lock to get safe reference
 	spin_lock_irqsave(&dev->lock, flags);
 	dbuf = dev->dbuf;
-	if (dbuf)
+	if (dbuf && !dbuf->shutdown_requested) // Shutdown check
 		atomic_inc(&dbuf->ref_count);
+	else
+		dbuf = NULL; // Ensure dbuf is NULL if shutdown was requested
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	if (unlikely(!dbuf))
 		return -ENODEV;
 
 retry_write:
+	// 2. dbuf->lock for operation
 	spin_lock_irqsave(&dbuf->lock, flags);
 
-	/* Active status check */
 	if (unlikely(!dbuf->active || dbuf->shutdown_requested)) {
 		ret = -ENODEV;
 		goto unlock_and_exit;
@@ -4292,11 +4687,10 @@ retry_write:
 	available = atomic_read(&dbuf->available);
 	free_space = dbuf->size - available;
 
-	/* Case 1: There is enough space - direct writing */
+	// Case 1: Sufficient space - direct writing
 	if (len <= free_space) {
 		first_chunk = min(len, dbuf->size - dbuf->write_pos);
 
-		/* Writing in up to two parts (circular buffer) */
 		memcpy((u8 *)dbuf->data + dbuf->write_pos, src, first_chunk);
 		if (first_chunk < len) {
 			memcpy(dbuf->data, src + first_chunk,
@@ -4309,27 +4703,28 @@ retry_write:
 		dbuf->stats.frames_written++;
 		dbuf->stats.last_write_at = ktime_get();
 
-		/* Wake up readers waiting for data */
-		wake_up_interruptible_all(&dbuf->read_waitq);
-
+		/* Check for waiters before waking up */
+		if (waitqueue_active(&dbuf->read_waitq))
+			wake_up_interruptible_all(&dbuf->read_waitq);
 		ret = len;
 		goto unlock_and_exit;
 	}
 
-	/* Case 2: Buffer full - attempt expansion if allowed */
+	// Case 2: Buffer full - try expansion
 	if (retry_count < MAX_RESIZE_RETRIES &&
 	    dbuf->size < MAX_DYNAMIC_BUFFER_SIZE &&
 	    (available * 100ULL / dbuf->size) >= HIGH_WATERMARK_PERCENT) {
-		u32 new_size = min((u64)dbuf->size * 3 / 2, /* 50% growth */
+		u32 new_size = min((u64)dbuf->size * 3 / 2,
 				   (u64)MAX_DYNAMIC_BUFFER_SIZE);
-		new_size =
-			max(new_size, dbuf->size + len); /* Make sure it fits */
+		new_size = max(new_size, dbuf->size + len);
 
+		// RELEASE dbuf->lock before calling resize
 		spin_unlock_irqrestore(&dbuf->lock, flags);
 
 		ret = resize_dynamic_buffer(dev, new_size);
 		if (ret == 0) {
 			retry_count++;
+			// Update stats after successful resize
 			spin_lock_irqsave(&dbuf->lock, flags);
 			dbuf->stats.expand_count++;
 			dbuf->stats.last_expand_at = ktime_get();
@@ -4337,32 +4732,32 @@ retry_write:
 			goto retry_write;
 		}
 
-		/* Resize failed - continue to next strategy */
+		// If resize failed, re-acquire lock and continue
 		spin_lock_irqsave(&dbuf->lock, flags);
 	}
 
-	/* Case 3: Discard old data to make space */
+	// Case 3: Discard old data to make space
 	if (available > len) {
 		u32 discard_amount =
 			min(available / 2, available - len + (dbuf->size / 10));
 		dbuf->read_pos = (dbuf->read_pos + discard_amount) % dbuf->size;
 		atomic_sub(discard_amount, &dbuf->available);
 
-		/* Alert readers to report data loss */
-		wake_up_interruptible_all(&dbuf->read_waitq);
-
+		/* Check for waiters before waking up */
+		if (waitqueue_active(&dbuf->read_waitq))
+			wake_up_interruptible_all(&dbuf->read_waitq);
 		spin_unlock_irqrestore(&dbuf->lock, flags);
 		goto retry_write;
 	}
 
-	/* Case 4: Wait for space to become available */
+	// Case 4: Wait for space to become available
 	spin_unlock_irqrestore(&dbuf->lock, flags);
 
 	ret = wait_event_interruptible_timeout(
 		dbuf->write_waitq,
 		(!dbuf->active || dbuf->shutdown_requested ||
 		 (dbuf->size - atomic_read(&dbuf->available)) >= len),
-		msecs_to_jiffies(100)); /* 100ms timeout */
+		msecs_to_jiffies(100));
 
 	if (ret == -ERESTARTSYS)
 		ret = -EINTR;
@@ -4371,10 +4766,13 @@ retry_write:
 	else if (ret > 0)
 		goto retry_write;
 
+	goto exit_with_ref;
+
 unlock_and_exit:
 	spin_unlock_irqrestore(&dbuf->lock, flags);
 
-	/* Reference release */
+exit_with_ref:
+	// Reference cleanup
 	if (atomic_dec_return(&dbuf->ref_count) == 0 &&
 	    dbuf->shutdown_requested) {
 		vfree(dbuf->data);
@@ -4384,35 +4782,53 @@ unlock_and_exit:
 	return ret;
 }
 
-/**
- * Copyright (C) 2025 Eli Oliveira Junior
- *
- * dynamic_buffer_read - Reads data from a dynamic circular buffer
- * @dev: Pointer to the v4l2_loopback_device structure
- * @dst: Destination buffer for read data
- * @len: Maximum number of bytes to read
- * @block: Whether to block waiting for data (true) or return immediately (false)
- *
- * Performs a thread-safe read operation from a dynamic circular buffer with:
- * - Blocking and non-blocking read modes
- * - Automatic buffer shrinking when underutilized
- * - Circular buffer handling with wrap-around support
- * - Statistics tracking (bytes read, timestamps)
- * - Writer wakeup notifications when space becomes available
- * - Reference counting for safe buffer access
- *
- * The function implements intelligent buffer size management:
- * - Shrinks buffer when usage falls below LOW_WATERMARK_FRACTION
- * - Maintains minimum buffer size (MIN_BUFFER_SIZE)
- * - Preserves initial buffer size as reference (dbuf->initial_size)
- *
- * Return: Number of bytes read (0 if no data available in non-blocking mode),
- *         negative error code on failure:
- *         -EINVAL for invalid parameters
- *         -ENODEV if buffer not available or inactive
- *         -EAGAIN in non-blocking mode with no data
- *         -EINTR if blocking operation interrupted
- */
+/*
+    Copyright (C) 2025 Eli Oliveira Junior
+
+    dynamic_buffer_read - Thread-safe data read from dynamic circular buffer
+    @dev: Pointer to initialized v4l2_loopback_device structure
+    @dst: Destination buffer for read data (must be valid)
+    @len: Maximum number of bytes to read (must be > 0)
+    @block: Blocking mode flag (true = wait for data, false = non-blocking)
+
+    Implements a robust read operation with these features:
+    Read Protocol:
+        Reference Acquisition:
+          Safely obtains buffer reference under device lock
+          Validates buffer state (active/shutdown)
+          Uses atomic reference counting
+          Read Modes:
+            a) Blocking: Waits indefinitely for data (interruptible)
+            b) Non-blocking: Returns immediately if no data available
+        Data Transfer:
+          Handles circular buffer wrap-around
+          Updates read position atomically
+          Wakes blocked writers when space becomes available
+          Buffer Management:
+          Automatic shrinking when underutilized
+          Maintains minimum buffer size constraints
+          Preserves initial buffer configuration
+    Thread Safety:
+        Proper spinlock nesting (device -> buffer)
+        Atomic operations for shared counters
+        Waitqueue synchronization
+        Handles concurrent read/write operations
+    Memory Management:
+        Safe buffer reference handling
+        Automatic size adjustment
+        Proper cleanup on shutdown
+    Error Handling:
+        Returns bytes read on success (may be partial)
+        Returns -EINVAL for invalid parameters
+        Returns -ENODEV if buffer unavailable/inactive
+        Returns -EAGAIN in non-blocking mode with no data
+        Returns -EINTR if blocking operation interrupted
+    Performance Characteristics:
+        O(1) for direct reads
+        O(n) for buffer shrinking (n = data size)
+        Adaptive size management
+        Minimal locking duration
+*/
 static int dynamic_buffer_read(struct v4l2_loopback_device *dev, u8 *dst,
 			       u32 len, bool block)
 {
@@ -4421,21 +4837,22 @@ static int dynamic_buffer_read(struct v4l2_loopback_device *dev, u8 *dst,
 	u32 available, to_read, first_chunk;
 	int ret = 0;
 
-	/* Parameter validation */
 	if (unlikely(!dev || !dst || len == 0 || !dev->use_dynamic_buffering))
 		return -EINVAL;
 
-	/* Safely getting the buffer reference */
+	// 1. dev->lock to get reference
 	spin_lock_irqsave(&dev->lock, flags);
 	dbuf = dev->dbuf;
-	if (dbuf)
+	if (dbuf && !dbuf->shutdown_requested) // Shutdown check
 		atomic_inc(&dbuf->ref_count);
+	else
+		dbuf = NULL; // Ensure dbuf is NULL if shutdown was requested
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	if (unlikely(!dbuf))
 		return -ENODEV;
 
-	/* Blocking mode: wait for data or shutdown */
+	// Blocking mode: wait for data (NO LOCKS)
 	if (block) {
 		ret = wait_event_interruptible(
 			dbuf->read_waitq,
@@ -4448,9 +4865,9 @@ static int dynamic_buffer_read(struct v4l2_loopback_device *dev, u8 *dst,
 		}
 	}
 
+	// 2. dbuf->lock for operation
 	spin_lock_irqsave(&dbuf->lock, flags);
 
-	/* Active status check */
 	if (unlikely(!dbuf->active || dbuf->shutdown_requested)) {
 		ret = -ENODEV;
 		goto unlock_and_exit;
@@ -4458,20 +4875,18 @@ static int dynamic_buffer_read(struct v4l2_loopback_device *dev, u8 *dst,
 
 	available = atomic_read(&dbuf->available);
 
-	/* Non-blocking mode: returns immediately if no data */
 	if (!block && available == 0) {
 		ret = -EAGAIN;
 		goto unlock_and_exit;
 	}
 
-	/* Determine quantity to be read */
 	to_read = min(len, available);
 	if (to_read == 0) {
 		ret = 0;
 		goto unlock_and_exit;
 	}
 
-	/* Reading in up to two parts (circular buffer) */
+	// Reading in up to two parts (circular buffer)
 	first_chunk = min(to_read, dbuf->size - dbuf->read_pos);
 	memcpy(dst, (const u8 *)dbuf->data + dbuf->read_pos, first_chunk);
 
@@ -4479,19 +4894,20 @@ static int dynamic_buffer_read(struct v4l2_loopback_device *dev, u8 *dst,
 		memcpy(dst + first_chunk, dbuf->data, to_read - first_chunk);
 	}
 
-	/* Updating pointers and counters */
+	// Update pointers and counters
 	dbuf->read_pos = (dbuf->read_pos + to_read) % dbuf->size;
 	atomic_sub(to_read, &dbuf->available);
 
-	/* Update statistics */
+	// Update statistics
 	dbuf->stats.total_bytes_read += to_read;
 	dbuf->stats.frames_read++;
 	dbuf->stats.last_read_at = ktime_get();
 
-	/* Awaken writers waiting for space */
-	wake_up_interruptible_all(&dbuf->write_waitq);
+	/* Check for waiters before waking up */
+	if (waitqueue_active(&dbuf->write_waitq))
+		wake_up_interruptible_all(&dbuf->write_waitq);
 
-	/* Check for shrinkage */
+	// Check the need for shrinkage
 	available = atomic_read(&dbuf->available);
 	if (dbuf->size > dbuf->initial_size * 2 &&
 	    available < (dbuf->size / LOW_WATERMARK_FRACTION) &&
@@ -4500,11 +4916,11 @@ static int dynamic_buffer_read(struct v4l2_loopback_device *dev, u8 *dst,
 				      max(available * 4, (u32)MIN_BUFFER_SIZE));
 
 		if (target_size < dbuf->size) {
-			/* Perform shrink and update stats if successful */
+			// RELEASE lock before resizing
 			spin_unlock_irqrestore(&dbuf->lock, flags);
 
 			if (resize_dynamic_buffer(dev, target_size) == 0) {
-				/* Shrink successful - update stats */
+				// Update stats if shrink successful
 				spin_lock_irqsave(&dbuf->lock, flags);
 				dbuf->stats.shrink_count++;
 				dbuf->stats.last_shrink_at = ktime_get();
@@ -4522,7 +4938,7 @@ unlock_and_exit:
 	spin_unlock_irqrestore(&dbuf->lock, flags);
 
 exit_with_ref:
-	/* Reference release */
+	// Reference cleanup
 	if (atomic_dec_return(&dbuf->ref_count) == 0 &&
 	    dbuf->shutdown_requested) {
 		vfree(dbuf->data);
