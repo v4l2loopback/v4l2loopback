@@ -23,6 +23,7 @@
 #include <linux/slab.h>
 #include <linux/fs.h>
 #include <linux/capability.h>
+#include <linux/timer.h>
 #include <linux/eventpoll.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-common.h>
