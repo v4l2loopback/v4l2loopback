@@ -3,4 +3,4 @@
 skip = .git*,.codespellrc
 check-hidden = true
 # ignore-regex = 
-ignore-words-list = parm
+ignore-words-list = parm,parms
