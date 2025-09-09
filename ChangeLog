@@ -206,7 +206,7 @@ v4l2loopback (0.13.0) unstable; urgency=medium
   * mention that v4l2_loopback_config.announce_all_caps is to be going away
   * more specific rule for creating persistent names
   * rule to allow members of 'video' to change device-properties via sysfs
-  * restructed usage() a bit
+  * restructured usage() a bit
   * implement "set-fps"
   * also format code in utils/
   * moved v4l2loopback version to header file
@@ -1237,7 +1237,7 @@ v4l2loopback (0.1) UNRELEASED; urgency=low
   * added test file
   * added VIDIOC_G_PARM call
   * format handling improvement, current solution is a stub
-  * temporarly removed mmap to keep code simple
+  * temporarily removed mmap to keep code simple
   * compile fix
   * poll added, streaming started
   * small test refine
