@@ -1,3 +1,15 @@
+v4l2loopback (0.15.2) unstable; urgency=medium
+
+  [ Simon Richter ]
+  * Add <linux/timer.h> include
+
+  [ IOhannes m zmölnig ]
+  * Fix use-after-free in loopback_add()
+    Thanks to Team 42-b3yond-6ug <https://b3yond.org/>
+  * Fix compilation with linux-6.18.0
+
+ -- IOhannes m zmölnig (Debian/GNU) <umlaeute@debian.org>  Wed, 15 Oct 2025 19:54:52 +0200
+
 v4l2loopback (0.15.1) unstable; urgency=medium
 
   [ Neil Armstrong ]

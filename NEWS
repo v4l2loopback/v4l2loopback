@@ -1,3 +1,10 @@
+v4l2loopback (0.15.2) unstable; urgency=medium
+
+  * Fix FTBFS with linux 6.18+
+  * Fix use-after-free in loopback_add()
+
+ -- IOhannes m zmölnig (Debian/GNU) <umlaeute@debian.org>  Wed, 15 Oct 2025 19:54:52 +0200
+
 v4l2loopback (0.15.1) unstable; urgency=medium
 
   * Fix FTBFS with linux 6.16+
