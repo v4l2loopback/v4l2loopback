@@ -32,7 +32,7 @@ v4l2loopback (0.14.0) unstable; urgency=medium
 
   * Refactor poll()
   * Fix FIFO management
-  * V4L2 UAPI compliance in format negotation and stream activation
+  * V4L2 UAPI compliance in format negotiation and stream activation
   * Do not discard return value of vm_alloc_page
   * Use atomic operations to count vm_open/close
   * Simplify loop preparation cases in  mmap()
@@ -42,7 +42,7 @@ v4l2loopback (0.14.0) unstable; urgency=medium
 
 v4l2loopback-0.13.2
 
-  * V4L2 UAPI compliance in format negotation and stream activation
+  * V4L2 UAPI compliance in format negotiation and stream activation
   * Fix FIFO management
   * Fix poll()
 
