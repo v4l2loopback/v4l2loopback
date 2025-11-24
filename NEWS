@@ -1,3 +1,9 @@
+v4l2loopback (0.15.3) unstable; urgency=medium
+
+  * Fix oops with linux 6.18+
+
+ -- IOhannes m zmölnig (Debian/GNU) <umlaeute@debian.org>  Mon, 24 Nov 2025 14:11:58 +0100
+
 v4l2loopback (0.15.2) unstable; urgency=medium
 
   * Fix FTBFS with linux 6.18+
