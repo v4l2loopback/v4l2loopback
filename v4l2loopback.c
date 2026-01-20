@@ -1601,29 +1601,19 @@ static void prepare_buffer_queue(struct v4l2_loopback_device *dev, int count)
 
 	spin_lock_bh(&dev->list_lock);
 
-	/* ensure sufficient number of buffers in queue */
+	/* Remove all buffers from the output queue - they will be added
+	 * when queued via VIDIOC_QBUF */
+	list_for_each_entry_safe(bufd, n, &dev->outbufs_list, list_head) {
+		list_del_init(&bufd->list_head);
+	}
+
+	/* buffers are no longer queued; reset write position tracking */
 	for (pos = 0; pos < count; ++pos) {
 		bufd = &dev->buffers[pos];
-		if (list_empty(&bufd->list_head))
-			list_add_tail(&bufd->list_head, &dev->outbufs_list);
-	}
-	if (list_empty(&dev->outbufs_list))
-		goto exit_prepare_queue_unlock;
-
-	/* remove any excess buffers */
-	list_for_each_entry_safe(bufd, n, &dev->outbufs_list, list_head) {
-		if (bufd->buffer.index >= count)
-			list_del_init(&bufd->list_head);
-	}
-
-	/* buffers are no longer queued; and `write_position` will correspond
-	 * to the first item of `outbufs_list`. */
-	pos = v4l2l_mod64(dev->write_position, count);
-	list_for_each_entry(bufd, &dev->outbufs_list, list_head) {
 		unset_flags(bufd->buffer.flags);
 		dev->bufpos2index[pos % count] = bufd->buffer.index;
-		++pos;
 	}
+
 exit_prepare_queue_unlock:
 	spin_unlock_bh(&dev->list_lock);
 }
@@ -2009,7 +1999,7 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 		bufd = list_first_entry_or_null(&dev->outbufs_list,
 						struct v4l2l_buffer, list_head);
 		if (bufd)
-			list_move_tail(&bufd->list_head, &dev->outbufs_list);
+			list_del_init(&bufd->list_head);
 
 		spin_unlock_bh(&dev->list_lock);
 		if (!bufd)
