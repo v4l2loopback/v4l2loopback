@@ -1651,6 +1651,9 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 		reqbuf->memory, req_count, dev->used_buffer_count,
 		dev->buffer_count);
 
+	if (req_count > dev->buffer_count)
+		req_count = dev->buffer_count;
+
 	switch (reqbuf->memory) {
 	case V4L2_MEMORY_MMAP:
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)
@@ -1727,10 +1730,6 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 
 	MARK();
 	opener->buffer_count = 0;
-
-	if (req_count > dev->buffer_count)
-		req_count = dev->buffer_count;
-
 	if (has_no_owners(dev)) {
 		result = allocate_buffers(dev, &dev->pix_format);
 		if (result < 0)
