@@ -1597,6 +1597,7 @@ static bool any_buffers_mapped(struct v4l2_loopback_device *dev)
 static void prepare_buffer_queue(struct v4l2_loopback_device *dev, int count)
 {
 	struct v4l2l_buffer *bufd, *n;
+	struct v4l2_fh *fhp;
 	u32 pos;
 
 	spin_lock_bh(&dev->list_lock);
@@ -1607,14 +1608,26 @@ static void prepare_buffer_queue(struct v4l2_loopback_device *dev, int count)
 		list_del_init(&bufd->list_head);
 	}
 
-	/* buffers are no longer queued; reset write position tracking */
+	/* Reset write_position to 0 so bufpos2index[0..count-1] mapping stays
+	 * aligned: the loop below fills positions 0..count-1 starting from index 0,
+	 * so write_position must also start from 0 after a STREAMOFF/REQBUFS. */
+	dev->write_position = 0;
+
 	for (pos = 0; pos < count; ++pos) {
 		bufd = &dev->buffers[pos];
 		unset_flags(bufd->buffer.flags);
 		dev->bufpos2index[pos % count] = bufd->buffer.index;
 	}
 
-exit_prepare_queue_unlock:
+	/* Reset all openers' read_position to stay consistent with the freshly
+	 * zeroed write_position; otherwise readers would see a stale offset into
+	 * the re-initialised bufpos2index table. */
+	list_for_each_entry(fhp, &dev->vdev->fh_list, list) {
+		struct v4l2_loopback_opener *op =
+			container_of(fhp, struct v4l2_loopback_opener, fh);
+		op->read_position = 0;
+	}
+
 	spin_unlock_bh(&dev->list_lock);
 }
 
