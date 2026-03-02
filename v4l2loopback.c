@@ -1909,6 +1909,17 @@ static int can_read(struct v4l2_loopback_device *dev,
 	return ret;
 }
 
+/* check whether an OUTPUT buffer is available for DQBUF */
+static int can_dq_output(struct v4l2_loopback_device *dev)
+{
+	int ret;
+
+	spin_lock_bh(&dev->list_lock);
+	ret = !list_empty(&dev->outbufs_list);
+	spin_unlock_bh(&dev->list_lock);
+	return ret;
+}
+
 static int get_capture_buffer(struct file *file)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
@@ -1994,16 +2005,26 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 		unset_flags(buf->flags);
 		break;
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
+		/*
+		 * V4L2 compliance: if O_NONBLOCK and no buffer available,
+		 * return -EAGAIN immediately (like the CAPTURE path does).
+		 * Otherwise block until a buffer is queued by the writer.
+		 * Return -ERESTARTSYS if interrupted by a signal.
+		 */
 		spin_lock_bh(&dev->list_lock);
-
-		bufd = list_first_entry_or_null(&dev->outbufs_list,
-						struct v4l2l_buffer, list_head);
-		if (bufd)
-			list_del_init(&bufd->list_head);
-
+		while (list_empty(&dev->outbufs_list)) {
+			spin_unlock_bh(&dev->list_lock);
+			if (file->f_flags & O_NONBLOCK)
+				return -EAGAIN;
+			if (wait_event_interruptible(dev->read_event,
+						     can_dq_output(dev)))
+				return -ERESTARTSYS;
+			spin_lock_bh(&dev->list_lock);
+		}
+		bufd = list_first_entry(&dev->outbufs_list,
+					struct v4l2l_buffer, list_head);
+		list_del_init(&bufd->list_head);
 		spin_unlock_bh(&dev->list_lock);
-		if (!bufd)
-			return -EFAULT;
 		unset_flags(bufd->buffer.flags);
 		*buf = bufd->buffer;
 		break;
