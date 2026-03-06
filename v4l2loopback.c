@@ -1597,34 +1597,37 @@ static bool any_buffers_mapped(struct v4l2_loopback_device *dev)
 static void prepare_buffer_queue(struct v4l2_loopback_device *dev, int count)
 {
 	struct v4l2l_buffer *bufd, *n;
+	struct v4l2_fh *fhp;
 	u32 pos;
 
 	spin_lock_bh(&dev->list_lock);
 
-	/* ensure sufficient number of buffers in queue */
+	/* Remove all buffers from the output queue - they will be added
+	 * when queued via VIDIOC_QBUF */
+	list_for_each_entry_safe(bufd, n, &dev->outbufs_list, list_head) {
+		list_del_init(&bufd->list_head);
+	}
+
+	/* Reset write_position to 0 so bufpos2index[0..count-1] mapping stays
+	 * aligned: the loop below fills positions 0..count-1 starting from index 0,
+	 * so write_position must also start from 0 after a STREAMOFF/REQBUFS. */
+	dev->write_position = 0;
+
 	for (pos = 0; pos < count; ++pos) {
 		bufd = &dev->buffers[pos];
-		if (list_empty(&bufd->list_head))
-			list_add_tail(&bufd->list_head, &dev->outbufs_list);
-	}
-	if (list_empty(&dev->outbufs_list))
-		goto exit_prepare_queue_unlock;
-
-	/* remove any excess buffers */
-	list_for_each_entry_safe(bufd, n, &dev->outbufs_list, list_head) {
-		if (bufd->buffer.index >= count)
-			list_del_init(&bufd->list_head);
-	}
-
-	/* buffers are no longer queued; and `write_position` will correspond
-	 * to the first item of `outbufs_list`. */
-	pos = v4l2l_mod64(dev->write_position, count);
-	list_for_each_entry(bufd, &dev->outbufs_list, list_head) {
 		unset_flags(bufd->buffer.flags);
 		dev->bufpos2index[pos % count] = bufd->buffer.index;
-		++pos;
 	}
-exit_prepare_queue_unlock:
+
+	/* Reset all openers' read_position to stay consistent with the freshly
+	 * zeroed write_position; otherwise readers would see a stale offset into
+	 * the re-initialised bufpos2index table. */
+	list_for_each_entry(fhp, &dev->vdev->fh_list, list) {
+		struct v4l2_loopback_opener *op =
+			container_of(fhp, struct v4l2_loopback_opener, fh);
+		op->read_position = 0;
+	}
+
 	spin_unlock_bh(&dev->list_lock);
 }
 
@@ -1919,6 +1922,17 @@ static int can_read(struct v4l2_loopback_device *dev,
 	return ret;
 }
 
+/* check whether an OUTPUT buffer is available for DQBUF */
+static int can_dq_output(struct v4l2_loopback_device *dev)
+{
+	int ret;
+
+	spin_lock_bh(&dev->list_lock);
+	ret = !list_empty(&dev->outbufs_list);
+	spin_unlock_bh(&dev->list_lock);
+	return ret;
+}
+
 static int get_capture_buffer(struct file *file)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
@@ -2004,16 +2018,26 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 		unset_flags(buf->flags);
 		break;
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
+		/*
+		 * V4L2 compliance: if O_NONBLOCK and no buffer available,
+		 * return -EAGAIN immediately (like the CAPTURE path does).
+		 * Otherwise block until a buffer is queued by the writer.
+		 * Return -ERESTARTSYS if interrupted by a signal.
+		 */
 		spin_lock_bh(&dev->list_lock);
-
-		bufd = list_first_entry_or_null(&dev->outbufs_list,
-						struct v4l2l_buffer, list_head);
-		if (bufd)
-			list_move_tail(&bufd->list_head, &dev->outbufs_list);
-
+		while (list_empty(&dev->outbufs_list)) {
+			spin_unlock_bh(&dev->list_lock);
+			if (file->f_flags & O_NONBLOCK)
+				return -EAGAIN;
+			if (wait_event_interruptible(dev->read_event,
+						     can_dq_output(dev)))
+				return -ERESTARTSYS;
+			spin_lock_bh(&dev->list_lock);
+		}
+		bufd = list_first_entry(&dev->outbufs_list,
+					struct v4l2l_buffer, list_head);
+		list_del_init(&bufd->list_head);
 		spin_unlock_bh(&dev->list_lock);
-		if (!bufd)
-			return -EFAULT;
 		unset_flags(bufd->buffer.flags);
 		*buf = bufd->buffer;
 		break;
