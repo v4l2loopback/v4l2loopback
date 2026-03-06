@@ -381,7 +381,7 @@ struct v4l2_loopback_device {
 				   * exchanging format tokens */
 	spinlock_t lock; /* lock for the timeout and framerate timers */
 	spinlock_t list_lock; /* lock for the OUTPUT buffer queue */
-	wait_queue_head_t read_event;
+	wait_queue_head_t queue_event; /* single waitqueue for both CAPTURE and OUTPUT */
 	u32 format_tokens; /* tokens to 'set format' for OUTPUT, CAPTURE, or
 			    * timeout buffers */
 	u32 stream_tokens; /* tokens to 'start' OUTPUT, CAPTURE, or timeout
@@ -1907,7 +1907,7 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 		*buf = bufd->buffer;
 		buffer_written(dev, bufd);
 		set_done(bufd->buffer.flags);
-		wake_up_all(&dev->read_event);
+		wake_up_all(&dev->queue_event);
 		break;
 	default:
 		return -EINVAL;
@@ -1929,6 +1929,17 @@ static int can_read(struct v4l2_loopback_device *dev,
 	return ret;
 }
 
+/* check whether an OUTPUT buffer is available for DQBUF */
+static int can_dq_output(struct v4l2_loopback_device *dev)
+{
+	int ret;
+
+	spin_lock_bh(&dev->list_lock);
+	ret = !list_empty(&dev->outbufs_list);
+	spin_unlock_bh(&dev->list_lock);
+	return ret;
+}
+
 static int get_capture_buffer(struct file *file)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
@@ -1942,7 +1953,7 @@ static int get_capture_buffer(struct file *file)
 	     dev->reread_count <= opener->reread_count &&
 	     !dev->timeout_happened))
 		return -EAGAIN;
-	wait_event_interruptible(dev->read_event, can_read(dev, opener));
+	wait_event_interruptible(dev->queue_event, can_read(dev, opener));
 
 	mutex_lock(&dev->image_mutex);
 	if (!dev->image || dev->used_buffer_count == 0) {
@@ -2018,16 +2029,35 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 		unset_flags(buf->flags);
 		break;
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
-		spin_lock_bh(&dev->list_lock);
+		/*
+		 * V4L2 spec (VIDIOC_DQBUF): "By default VIDIOC_DQBUF blocks
+		 * when no buffer is in the outgoing queue. When the O_NONBLOCK
+		 * flag was given to open(), VIDIOC_DQBUF returns immediately
+		 * with an EAGAIN error code when no buffer is available."
+		 * Ref: https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/vidioc-qbuf.html
+		 *
+		 * Loop to handle spurious wakeups and races where another
+		 * caller dequeues the buffer between our wakeup and lock.
+		 */
+		for (;;) {
+			spin_lock_bh(&dev->list_lock);
+			bufd = list_first_entry_or_null(&dev->outbufs_list,
+							struct v4l2l_buffer, list_head);
+			if (bufd)
+				list_del_init(&bufd->list_head);
 
-		bufd = list_first_entry_or_null(&dev->outbufs_list,
-						struct v4l2l_buffer, list_head);
-		if (bufd)
-			list_del_init(&bufd->list_head);
+			spin_unlock_bh(&dev->list_lock);
 
-		spin_unlock_bh(&dev->list_lock);
-		if (!bufd)
-			return -EFAULT;
+			if (bufd)
+				break;
+
+			if (file->f_flags & O_NONBLOCK)
+				return -EAGAIN;
+
+			if (wait_event_interruptible(dev->queue_event,
+						     can_dq_output(dev)))
+				return -ERESTARTSYS;
+		}
 		unset_flags(bufd->buffer.flags);
 		*buf = bufd->buffer;
 		break;
@@ -2300,7 +2330,7 @@ static unsigned int v4l2_loopback_poll(struct file *file,
 
 	/* call poll_wait in first call, regardless, to ensure that the
 	 * wait-queue is not null */
-	poll_wait(file, &dev->read_event, pts);
+	poll_wait(file, &dev->queue_event, pts);
 	poll_wait(file, &opener->fh.wait, pts);
 
 	if (req_events & POLLPRI) {
@@ -2526,7 +2556,7 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
 	set_queued(b->flags);
 	buffer_written(dev, &dev->buffers[index]);
 	set_done(b->flags);
-	wake_up_all(&dev->read_event);
+	wake_up_all(&dev->queue_event);
 
 	return count;
 }
@@ -2733,7 +2763,7 @@ static void sustain_timer_clb(unsigned long nr)
 		else
 			mod_timer(&dev->sustain_timer,
 				  jiffies + dev->frame_jiffies);
-		wake_up_all(&dev->read_event);
+		wake_up_all(&dev->queue_event);
 	}
 	spin_unlock(&dev->lock);
 }
@@ -2752,7 +2782,7 @@ static void timeout_timer_clb(unsigned long nr)
 	if (dev->timeout_jiffies > 0) {
 		dev->timeout_happened = 1;
 		mod_timer(&dev->timeout_timer, jiffies + dev->timeout_jiffies);
-		wake_up_all(&dev->read_event);
+		wake_up_all(&dev->queue_event);
 	}
 	spin_unlock(&dev->lock);
 }
@@ -2936,7 +2966,7 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	mutex_init(&dev->image_mutex);
 	spin_lock_init(&dev->lock);
 	spin_lock_init(&dev->list_lock);
-	init_waitqueue_head(&dev->read_event);
+	init_waitqueue_head(&dev->queue_event);
 	dev->format_tokens = V4L2L_TOKEN_MASK;
 	dev->stream_tokens = V4L2L_TOKEN_MASK;
 
