@@ -75,6 +75,12 @@ struct v4l2_loopback_config {
 	 *       devices are implemented
          */
 	__s32 announce_all_caps;
+
+	/**
+	 * prevent DQBUF of an unqueued buffer for stronger V4L2 compliance and
+	 * compatability with gstreamer
+	 */
+	__s32 strict_queue;
 };
 
 #define V4L2LOOPBACK_CTL_IOCTLMAGIC '~'

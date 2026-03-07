@@ -166,6 +166,12 @@ typedef unsigned __poll_t;
 #define V4L2LOOPBACK_DEFAULT_EXCLUSIVECAPS 0
 #endif
 
+/* as per original loopback module - default is to allow the return of an
+ * unqueued buffer from DQBUF */
+#ifndef V4L2LOOPBACK_DEFAULT_STRICT_QUEUE
+#define V4L2LOOPBACK_DEFAULT_STRICT_QUEUE 0
+#endif
+
 /* when a producer is considered to have gone stale */
 #ifndef MAX_TIMEOUT
 #define MAX_TIMEOUT (100 * 1000) /* in msecs */
@@ -227,6 +233,14 @@ MODULE_PARM_DESC(
 	exclusive_caps,
 	"whether to announce OUTPUT/CAPTURE capabilities exclusively or not  [DEFAULT: " __stringify(
 		V4L2LOOPBACK_DEFAULT_EXCLUSIVECAPS) "]");
+
+static bool strict_queue[MAX_DEVICES] = {
+	[0 ...(MAX_DEVICES - 1)] = V4L2LOOPBACK_DEFAULT_STRICT_QUEUE
+};
+module_param_array(strict_queue, bool, NULL, 0444);
+MODULE_PARM_DESC(strict_queue,
+		 "prevent DQBUF of an unqueued buffer [DEFAULT: " __stringify(
+			 V4L2LOOPBACK_DEFAULT_STRICT_QUEUE) "]");
 
 /* format specifications */
 #define V4L2LOOPBACK_SIZE_MIN_WIDTH 2
@@ -327,7 +341,9 @@ struct v4l2loopback_private {
 
 struct v4l2l_buffer {
 	struct v4l2_buffer buffer;
-	struct list_head list_head;
+	struct list_head output_queue_lh;
+	struct list_head capture_queue_lh;
+	__u32 capture_flags;
 	atomic_t use_count;
 };
 
@@ -341,6 +357,7 @@ struct v4l2_loopback_device {
 	bool announce_all_caps; /* announce both OUTPUT and CAPTURE capabilities
 				 * when true; else announce OUTPUT when no
 				 * writer is streaming, otherwise CAPTURE. */
+	bool strict_queue; /* only return queued buffers from DQBUF */
 	int max_openers; /* how many times can this device be opened */
 	int min_width, max_width;
 	int min_height, max_height;
@@ -369,7 +386,8 @@ struct v4l2_loopback_device {
 	u32 buffer_count; /* should not be big, 4 is a good choice */
 	u32 buffer_size; /* number of bytes alloc'd per buffer */
 	u32 used_buffer_count; /* number of buffers allocated to openers */
-	struct list_head outbufs_list; /* FIFO queue for OUTPUT buffers */
+	struct list_head output_queue; /* FIFO queue for OUTPUT buffers */
+	struct list_head capture_queue; /* outgoing queue for CAPTURE buffers */
 	u32 bufpos2index[MAX_BUFFERS]; /* mapping of `(position % used_buffers)`
 					* to `buffers[index]` */
 	s64 write_position; /* sequence number of last 'displayed' buffer plus
@@ -1562,17 +1580,16 @@ static int vidioc_s_input(struct file *file, void *fh, unsigned int index)
 	 (index) < (opener)->buffer_count)
 #define BUFFER_DEBUG_FMT_STR                                      \
 	"buffer#%u @ %p type=%u bytesused=%u length=%u flags=%x " \
-	"field=%u timestamp= %lld.%06lldsequence=%u\n"
+	"field=%u timestamp= %lld.%06lld sequence=%u\n"
 #define BUFFER_DEBUG_FMT_ARGS(buf)                                         \
 	(buf)->index, (buf), (buf)->type, (buf)->bytesused, (buf)->length, \
 		(buf)->flags, (buf)->field,                                \
 		(long long)(buf)->timestamp.tv_sec,                        \
 		(long long)(buf)->timestamp.tv_usec, (buf)->sequence
 /* Buffer flag helpers */
-#define unset_flags(flags)                      \
-	do {                                    \
-		flags &= ~V4L2_BUF_FLAG_QUEUED; \
-		flags &= ~V4L2_BUF_FLAG_DONE;   \
+#define unset_flags(flags)                                             \
+	do {                                                           \
+		flags &= ~(V4L2_BUF_FLAG_QUEUED | V4L2_BUF_FLAG_DONE); \
 	} while (0)
 #define set_queued(flags)                      \
 	do {                                   \
@@ -1594,37 +1611,28 @@ static bool any_buffers_mapped(struct v4l2_loopback_device *dev)
 	return false;
 }
 
-static void prepare_buffer_queue(struct v4l2_loopback_device *dev, int count)
+static void reset_buffer_queue(struct v4l2_loopback_device *dev,
+			       enum v4l2_buf_type type)
 {
 	struct v4l2l_buffer *bufd, *n;
-	u32 pos;
 
 	spin_lock_bh(&dev->list_lock);
 
-	/* ensure sufficient number of buffers in queue */
-	for (pos = 0; pos < count; ++pos) {
-		bufd = &dev->buffers[pos];
-		if (list_empty(&bufd->list_head))
-			list_add_tail(&bufd->list_head, &dev->outbufs_list);
+	if (V4L2_TYPE_IS_OUTPUT(type)) {
+		list_for_each_entry_safe(bufd, n, &dev->output_queue,
+					 output_queue_lh) {
+			list_del_init(&bufd->output_queue_lh);
+			unset_flags(bufd->buffer.flags);
+		}
 	}
-	if (list_empty(&dev->outbufs_list))
-		goto exit_prepare_queue_unlock;
+	if (V4L2_TYPE_IS_CAPTURE(type)) {
+		list_for_each_entry_safe(bufd, n, &dev->capture_queue,
+					 capture_queue_lh) {
+			list_del_init(&bufd->capture_queue_lh);
+			unset_flags(bufd->capture_flags);
+		}
+	}
 
-	/* remove any excess buffers */
-	list_for_each_entry_safe(bufd, n, &dev->outbufs_list, list_head) {
-		if (bufd->buffer.index >= count)
-			list_del_init(&bufd->list_head);
-	}
-
-	/* buffers are no longer queued; and `write_position` will correspond
-	 * to the first item of `outbufs_list`. */
-	pos = v4l2l_mod64(dev->write_position, count);
-	list_for_each_entry(bufd, &dev->outbufs_list, list_head) {
-		unset_flags(bufd->buffer.flags);
-		dev->bufpos2index[pos % count] = bufd->buffer.index;
-		++pos;
-	}
-exit_prepare_queue_unlock:
 	spin_unlock_bh(&dev->list_lock);
 }
 
@@ -1645,6 +1653,7 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 			    token_from_type(reqbuf->type);
 	u32 req_count = reqbuf->count;
 	int result = 0;
+	u32 pos;
 
 	dprintk("REQBUFS(memory=%u, req_count=%u) and device-bufs=%u/%u "
 		"[used/max]\n",
@@ -1695,8 +1704,14 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 		 * ALSO release lock on logical stream */
 		if (opener->format_token)
 			release_token(dev, opener, format);
-		if (has_no_owners(dev))
+		if (has_no_owners(dev)) {
+			/* clear the sequence-to-index map */
+			spin_lock_bh(&dev->lock);
+			for (pos = 0; pos < dev->used_buffer_count; ++pos)
+				dev->bufpos2index[pos] = 0;
+			spin_unlock_bh(&dev->lock);
 			dev->used_buffer_count = 0;
+		}
 		goto exit_reqbufs_unlock;
 	}
 
@@ -1751,7 +1766,7 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 		break;
 	default:
 		opener->io_method = V4L2L_IO_MMAP;
-		prepare_buffer_queue(dev, req_count);
+		reset_buffer_queue(dev, reqbuf->type);
 		dev->used_buffer_count = opener->buffer_count = req_count;
 	}
 exit_reqbufs_unlock:
@@ -1771,6 +1786,7 @@ static int vidioc_querybuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	struct v4l2_loopback_opener *opener = v4l2l_f_to_opener(file, fh);
 	u32 type = buf->type;
 	u32 index = buf->index;
+	struct v4l2l_buffer *bufd;
 
 	if ((type != V4L2_BUF_TYPE_VIDEO_CAPTURE) &&
 	    (type != V4L2_BUF_TYPE_VIDEO_OUTPUT))
@@ -1779,24 +1795,24 @@ static int vidioc_querybuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 		return -EINVAL;
 
 	if (opener->format_token & V4L2L_TOKEN_TIMEOUT) {
-		*buf = dev->timeout_buffer.buffer;
-		buf->index = index;
+		bufd = &dev->timeout_buffer;
 	} else
-		*buf = dev->buffers[index].buffer;
+		bufd = &dev->buffers[index];
 
+	*buf = bufd->buffer;
+	buf->index = index;
 	buf->type = type;
+
+	if (V4L2_TYPE_IS_CAPTURE(type) &&
+	    !(opener->format_token & V4L2L_TOKEN_TIMEOUT)) {
+		unset_flags(buf->flags);
+		buf->flags |= bufd->capture_flags;
+	}
 
 	if (!(buf->flags & (V4L2_BUF_FLAG_DONE | V4L2_BUF_FLAG_QUEUED))) {
 		/* v4l2-compliance requires these to be zero */
 		buf->sequence = 0;
 		buf->timestamp.tv_sec = buf->timestamp.tv_usec = 0;
-	} else if (V4L2_TYPE_IS_CAPTURE(type)) {
-		/* guess flags based on sequence values */
-		if (buf->sequence >= opener->read_position) {
-			set_done(buf->flags);
-		} else if (buf->flags & V4L2_BUF_FLAG_DONE) {
-			set_queued(buf->flags);
-		}
 	}
 	dprintkrw("QUERYBUF(%s, index=%u) -> " BUFFER_DEBUG_FMT_STR,
 		  V4L2_TYPE_IS_CAPTURE(type) ? "CAPTURE" : "OUTPUT", index,
@@ -1811,11 +1827,17 @@ static void buffer_written(struct v4l2_loopback_device *dev,
 	timer_delete_sync(&dev->timeout_timer);
 
 	spin_lock_bh(&dev->list_lock);
-	list_move_tail(&buf->list_head, &dev->outbufs_list);
+	list_move_tail(&buf->output_queue_lh, &dev->output_queue);
+	set_done(buf->buffer.flags);
+	if (!dev->strict_queue || (buf->capture_flags & V4L2_BUF_FLAG_QUEUED)) {
+		list_move_tail(&buf->capture_queue_lh, &dev->capture_queue);
+		set_done(buf->capture_flags);
+	}
 	spin_unlock_bh(&dev->list_lock);
 
 	spin_lock_bh(&dev->lock);
-	dev->bufpos2index[v4l2l_mod64(dev->write_position,
+	buf->buffer.sequence = dev->write_position;
+	dev->bufpos2index[v4l2l_mod64(buf->buffer.sequence,
 				      dev->used_buffer_count)] =
 		buf->buffer.index;
 	++dev->write_position;
@@ -1858,7 +1880,13 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
 		dprintkrw("QBUF(CAPTURE, index=%u) -> " BUFFER_DEBUG_FMT_STR,
 			  index, BUFFER_DEBUG_FMT_ARGS(buf));
-		set_queued(buf->flags);
+		/* set to incoming queue if not on outgoing queue */
+		spin_lock_bh(&dev->list_lock);
+
+		if (list_empty(&bufd->capture_queue_lh))
+			set_queued(bufd->capture_flags);
+
+		spin_unlock_bh(&dev->list_lock);
 		break;
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
 		dprintkrw("QBUF(OUTPUT, index=%u) -> " BUFFER_DEBUG_FMT_STR,
@@ -1892,16 +1920,14 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 		} else {
 			bufd->buffer.bytesused = buf->bytesused;
 		}
-		bufd->buffer.sequence = dev->write_position;
-		set_queued(bufd->buffer.flags);
-		*buf = bufd->buffer;
 		buffer_written(dev, bufd);
-		set_done(bufd->buffer.flags);
 		wake_up_all(&dev->read_event);
 		break;
 	default:
 		return -EINVAL;
 	}
+	*buf = bufd->buffer;
+	set_queued(buf->flags);
 	buf->type = type;
 	return 0;
 }
@@ -1909,67 +1935,104 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 static int can_read(struct v4l2_loopback_device *dev,
 		    struct v4l2_loopback_opener *opener)
 {
-	int ret;
+	int writer_ahead, repeat_or_timeout;
 
+	/* check if can read according to the sequence counters */
 	spin_lock_bh(&dev->lock);
 	check_timers(dev);
-	ret = dev->write_position > opener->read_position ||
-	      dev->reread_count > opener->reread_count || dev->timeout_happened;
+	writer_ahead = dev->write_position > opener->read_position;
+	repeat_or_timeout = (dev->reread_count > opener->reread_count) ||
+			    dev->timeout_happened;
 	spin_unlock_bh(&dev->lock);
-	return ret;
+
+	/* short-circuit as queue is not used */
+	if (opener->io_method == V4L2L_IO_FILE)
+		return repeat_or_timeout || writer_ahead;
+
+	return repeat_or_timeout ||
+	       (writer_ahead && !list_empty(&dev->capture_queue));
 }
 
-static int get_capture_buffer(struct file *file)
+static int get_capture_buffer(struct file *file, struct v4l2l_buffer **bufd)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
 	struct v4l2_loopback_opener *opener =
 		v4l2l_f_to_opener(file, file->private_data);
-	int pos, timeout_happened;
+	int pos, timeout_happened, repeat_happened;
+	struct v4l2l_buffer *bufd_from;
 	u32 index;
+	s64 read_position;
 
-	if ((file->f_flags & O_NONBLOCK) &&
-	    (dev->write_position <= opener->read_position &&
-	     dev->reread_count <= opener->reread_count &&
-	     !dev->timeout_happened))
+	if (file->f_flags & O_NONBLOCK && !can_read(dev, opener))
 		return -EAGAIN;
 	wait_event_interruptible(dev->read_event, can_read(dev, opener));
 
 	spin_lock_bh(&dev->lock);
-	if (dev->write_position == opener->read_position) {
-		if (dev->reread_count > opener->reread_count + 2)
-			opener->reread_count = dev->reread_count - 1;
-		++opener->reread_count;
-		pos = v4l2l_mod64(opener->read_position +
-					  dev->used_buffer_count - 1,
-				  dev->used_buffer_count);
-	} else {
-		opener->reread_count = 0;
-		if (dev->write_position >
-		    opener->read_position + dev->used_buffer_count)
-			opener->read_position = dev->write_position - 1;
-		pos = v4l2l_mod64(opener->read_position,
-				  dev->used_buffer_count);
-		++opener->read_position;
-	}
-	timeout_happened = dev->timeout_happened && (dev->timeout_jiffies > 0);
-	dev->timeout_happened = 0;
-	spin_unlock_bh(&dev->lock);
+	read_position = opener->read_position;
+	timeout_happened = repeat_happened = 0;
 
-	index = dev->bufpos2index[pos];
+	if (dev->write_position == read_position) {
+		/* timeout or re-reading: send most-recently written frame */
+		timeout_happened = dev->timeout_happened &&
+				   (dev->timeout_jiffies > 0);
+		dev->timeout_happened = 0;
+
+		repeat_happened = dev->reread_count > 0;
+		if (repeat_happened)
+			++opener->reread_count;
+
+		if (dev->reread_count >= opener->reread_count + 2)
+			opener->reread_count = dev->reread_count;
+
+		read_position = dev->write_position - 1;
+	}
+
+	if (opener->io_method == V4L2L_IO_FILE || timeout_happened ||
+	    repeat_happened) {
+		pos = v4l2l_mod64(read_position, dev->used_buffer_count);
+		index = dev->bufpos2index[pos];
+		*bufd = &dev->buffers[index];
+	} else {
+		spin_lock_bh(&dev->list_lock);
+		(*bufd) = list_first_entry_or_null(&dev->capture_queue,
+						   struct v4l2l_buffer,
+						   capture_queue_lh);
+		spin_unlock_bh(&dev->list_lock);
+	}
+
+	spin_unlock_bh(&dev->lock);
+	if (!(*bufd))
+		return -EFAULT;
+
+	if (!repeat_happened)
+		opener->reread_count = 0;
+
+	/* transfer timeout image to buffer once */
 	if (timeout_happened) {
-		if (index >= dev->used_buffer_count) {
-			dprintkrw("get_capture_buffer() read position is at "
-				  "an unallocated buffer [index=%u]\n",
-				  index);
-			return -EFAULT;
-		}
-		/* although allocated on-demand, timeout_image is freed only
-		 * in free_buffers(), so we don't need to worry about it being
-		 * deallocated suddenly */
-		memcpy(dev->image + dev->buffers[index].buffer.m.offset,
+		memcpy(dev->image + (*bufd)->buffer.m.offset,
 		       dev->timeout_image, dev->buffer_size);
 	}
-	return (int)index;
+
+	/* repeat most-recently written frame when sustain FPS */
+	if (repeat_happened && (*bufd)->buffer.sequence != read_position) {
+		spin_lock_bh(&dev->lock);
+		pos = v4l2l_mod64(read_position, dev->used_buffer_count);
+		index = dev->bufpos2index[pos];
+		spin_lock_bh(&dev->lock);
+
+		bufd_from = &dev->buffers[index];
+		memcpy(dev->image + (*bufd)->buffer.m.offset,
+		       dev->image + bufd_from->buffer.m.offset,
+		       dev->buffer_size);
+		(*bufd)->buffer.sequence = read_position;
+		(*bufd)->buffer.timestamp = bufd_from->buffer.timestamp;
+		(*bufd)->buffer.bytesused = bufd_from->buffer.bytesused;
+	}
+
+	/* if buffer written more than once since last read; force catch up */
+	opener->read_position = (*bufd)->buffer.sequence + 1;
+
+	return 0;
 }
 
 /* put buffer to dequeue
@@ -1980,7 +2043,7 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
 	struct v4l2_loopback_opener *opener = v4l2l_f_to_opener(file, fh);
 	u32 type = buf->type;
-	int index;
+	int result;
 	struct v4l2l_buffer *bufd;
 
 	if (buf->memory != V4L2_MEMORY_MMAP)
@@ -1997,24 +2060,33 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 
 	switch (type) {
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
-		index = get_capture_buffer(file);
-		if (index < 0)
-			return index;
-		*buf = dev->buffers[index].buffer;
-		unset_flags(buf->flags);
+		result = get_capture_buffer(file, &bufd);
+		if (result < 0)
+			return result;
+		spin_lock_bh(&dev->list_lock);
+
+		if (!list_empty(&bufd->capture_queue_lh))
+			list_del_init(&bufd->capture_queue_lh);
+		unset_flags(bufd->capture_flags);
+
+		spin_unlock_bh(&dev->list_lock);
+		*buf = bufd->buffer;
+		buf->flags |= bufd->capture_flags;
 		break;
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
 		spin_lock_bh(&dev->list_lock);
 
-		bufd = list_first_entry_or_null(&dev->outbufs_list,
-						struct v4l2l_buffer, list_head);
-		if (bufd)
-			list_move_tail(&bufd->list_head, &dev->outbufs_list);
+		bufd = list_first_entry_or_null(&dev->output_queue,
+						struct v4l2l_buffer,
+						output_queue_lh);
+		if (bufd) {
+			list_del_init(&bufd->output_queue_lh);
+			unset_flags(bufd->buffer.flags);
+		}
 
 		spin_unlock_bh(&dev->list_lock);
 		if (!bufd)
 			return -EFAULT;
-		unset_flags(bufd->buffer.flags);
 		*buf = bufd->buffer;
 		break;
 	default:
@@ -2022,8 +2094,8 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	}
 
 	buf->type = type;
-	dprintkrw("DQBUF(%s, index=%u) -> " BUFFER_DEBUG_FMT_STR,
-		  V4L2_TYPE_IS_CAPTURE(type) ? "CAPTURE" : "OUTPUT", index,
+	dprintkrw("DQBUF(%s) -> " BUFFER_DEBUG_FMT_STR,
+		  V4L2_TYPE_IS_CAPTURE(type) ? "CAPTURE" : "OUTPUT",
 		  BUFFER_DEBUG_FMT_ARGS(buf));
 	return 0;
 }
@@ -2088,13 +2160,12 @@ static int vidioc_streamoff(struct file *file, void *fh,
 
 	switch (type) {
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
+		reset_buffer_queue(dev, type);
 		if (opener->stream_token & token)
 			release_token(dev, opener, stream);
-		/* reset output queue */
-		if (dev->used_buffer_count > 0)
-			prepare_buffer_queue(dev, dev->used_buffer_count);
 		return 0;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
+		reset_buffer_queue(dev, type);
 		if (opener->stream_token & token) {
 			release_token(dev, opener, stream);
 			client_usage_queue_event(dev->vdev);
@@ -2442,8 +2513,9 @@ static ssize_t v4l2_loopback_read(struct file *file, char __user *buf,
 				  size_t count, loff_t *ppos)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
+	struct v4l2l_buffer *bufd;
 	struct v4l2_buffer *b;
-	int index, result;
+	int result;
 
 	dprintkrw("read() %zu bytes\n", count);
 	result = start_fileio(file, file->private_data,
@@ -2451,10 +2523,10 @@ static ssize_t v4l2_loopback_read(struct file *file, char __user *buf,
 	if (result < 0)
 		return result;
 
-	index = get_capture_buffer(file);
-	if (index < 0)
-		return index;
-	b = &dev->buffers[index].buffer;
+	result = get_capture_buffer(file, &bufd);
+	if (result < 0)
+		return result;
+	b = &bufd->buffer;
 	if (count > b->bytesused)
 		count = b->bytesused;
 	if (copy_to_user((void *)buf, (void *)(dev->image + b->m.offset),
@@ -2492,10 +2564,7 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
 	b->bytesused = count;
 
 	v4l2l_get_timestamp(b);
-	b->sequence = dev->write_position;
-	set_queued(b->flags);
 	buffer_written(dev, &dev->buffers[index]);
-	set_done(b->flags);
 	wake_up_all(&dev->read_event);
 
 	return count;
@@ -2756,6 +2825,9 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	bool _announce_all_caps = (conf && conf->announce_all_caps >= 0) ?
 					  (bool)(conf->announce_all_caps) :
 					  !(V4L2LOOPBACK_DEFAULT_EXCLUSIVECAPS);
+	bool _strict_queue = (conf && conf->strict_queue >= 0) ?
+				     (bool)(conf->strict_queue) :
+				     V4L2LOOPBACK_DEFAULT_STRICT_QUEUE;
 	int _max_buffers = DEFAULT_FROM_CONF(max_buffers, <= 0, max_buffers);
 	int _max_openers = DEFAULT_FROM_CONF(max_openers, <= 0, max_openers);
 	struct v4l2_format _fmt;
@@ -2852,6 +2924,7 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	/* initialise v4l2-loopback specific parameters */
 	MARK();
 	dev->announce_all_caps = _announce_all_caps;
+	dev->strict_queue = _strict_queue;
 	dev->min_width = _min_width;
 	dev->min_height = _min_height;
 	dev->max_width = _max_width;
@@ -2891,11 +2964,14 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	dev->buffer_count = _max_buffers;
 	dev->buffer_size = 0;
 	dev->used_buffer_count = 0;
-	INIT_LIST_HEAD(&dev->outbufs_list);
+	INIT_LIST_HEAD(&dev->output_queue);
+	INIT_LIST_HEAD(&dev->capture_queue);
 	do {
 		u32 index;
-		for (index = 0; index < dev->buffer_count; ++index)
-			INIT_LIST_HEAD(&dev->buffers[index].list_head);
+		for (index = 0; index < dev->buffer_count; ++index) {
+			INIT_LIST_HEAD(&dev->buffers[index].output_queue_lh);
+			INIT_LIST_HEAD(&dev->buffers[index].capture_queue_lh);
+		}
 
 	} while (0);
 	memset(dev->bufpos2index, 0, sizeof(dev->bufpos2index));
@@ -3081,6 +3157,7 @@ static long v4l2loopback_control_ioctl(struct file *file, unsigned int cmd,
 		conf.max_width = dev->max_width;
 		conf.max_height = dev->max_height;
 		conf.announce_all_caps = dev->announce_all_caps;
+		conf.strict_queue = dev->strict_queue;
 		conf.max_buffers = dev->buffer_count;
 		conf.max_openers = dev->max_openers;
 		conf.debug = debug;
@@ -3278,6 +3355,7 @@ static int __init v4l2loopback_init_module(void)
 			.max_width		= max_width,
 			.max_height		= max_height,
 			.announce_all_caps	= (!exclusive_caps[i]),
+			.strict_queue		= strict_queue[i],
 			.max_buffers		= max_buffers,
 			.max_openers		= max_openers,
 			.debug			= debug,
