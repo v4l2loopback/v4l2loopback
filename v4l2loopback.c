@@ -1608,14 +1608,15 @@ static void prepare_buffer_queue(struct v4l2_loopback_device *dev, int count)
 		list_del_init(&bufd->list_head);
 	}
 
-	/* buffers are no longer queued; reset write position tracking */
+	/* Preserve the existing bufpos2index mapping so that capture readers
+	 * can still reference the last written frames after the output queue
+	 * has been cleared (e.g. via sustain_framerate or timeout mechanism).
+	 * Only clear the buffer flags. */
 	for (pos = 0; pos < count; ++pos) {
 		bufd = &dev->buffers[pos];
 		unset_flags(bufd->buffer.flags);
-		dev->bufpos2index[pos % count] = bufd->buffer.index;
 	}
 
-exit_prepare_queue_unlock:
 	spin_unlock_bh(&dev->list_lock);
 }
 
