@@ -1911,10 +1911,20 @@ static int can_read(struct v4l2_loopback_device *dev,
 	return ret;
 }
 
-/* check whether an OUTPUT buffer is available for DQBUF */
-static int can_dq_output(struct v4l2_loopback_device *dev)
+/* check whether an OUTPUT DQBUF waiter should unblock.
+ * Returns true if:
+ *   - the output stream has been stopped (STREAMOFF released the token),
+ *     so the waiter must return immediately with an error, OR
+ *   - there is at least one buffer in the output queue ready to dequeue.
+ * The stream-stopped check is first: STREAMOFF must always unblock waiters.
+ */
+static int can_dq_output(struct v4l2_loopback_device *dev,
+			 struct v4l2_loopback_opener *opener)
 {
 	int ret;
+
+	if (!(opener->stream_token & V4L2L_TOKEN_OUTPUT))
+		return 1;
 
 	spin_lock_bh(&dev->list_lock);
 	ret = !list_empty(&dev->outbufs_list);
@@ -2029,8 +2039,16 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 			if (file->f_flags & O_NONBLOCK)
 				return -EAGAIN;
 			if (wait_event_interruptible(dev->output_event,
-						     can_dq_output(dev)))
+						     can_dq_output(dev, opener)))
 				return -ERESTARTSYS;
+			/*
+			 * If woken because STREAMOFF released the stream
+			 * token, return -EAGAIN per V4L2 spec: STREAMOFF
+			 * implicitly dequeues all buffers and must unblock
+			 * pending DQBUF calls.
+			 */
+			if (!(opener->stream_token & V4L2L_TOKEN_OUTPUT))
+				return -EAGAIN;
 		}
 		unset_flags(bufd->buffer.flags);
 		*buf = bufd->buffer;
@@ -2111,6 +2129,13 @@ static int vidioc_streamoff(struct file *file, void *fh,
 		/* reset output queue */
 		if (dev->used_buffer_count > 0)
 			prepare_buffer_queue(dev, dev->used_buffer_count);
+		/*
+		 * Wake threads blocked in OUTPUT DQBUF.  After STREAMOFF
+		 * opener->stream_token is 0, so can_dq_output() returns
+		 * true and vidioc_dqbuf() will return -EAGAIN.
+		 * V4L2 spec: STREAMOFF must notify all pending operations.
+		 */
+		wake_up_all(&dev->output_event);
 		return 0;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
 		if (opener->stream_token & token) {
