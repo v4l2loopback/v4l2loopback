@@ -879,7 +879,9 @@ static struct v4l2_loopback_device *v4l2loopback_getdevice(struct file *f)
 
 /* forward declarations */
 static void client_usage_queue_event(struct video_device *vdev);
-static bool any_buffers_mapped(struct v4l2_loopback_device *dev);
+static bool any_mapped_buffer(struct v4l2_loopback_device *dev);
+static void get_buffer(struct v4l2l_buffer *buf);
+static void put_buffer(struct v4l2l_buffer *buf);
 static int allocate_buffers(struct v4l2_loopback_device *dev,
 			    struct v4l2_pix_format *pix_format);
 static void init_buffers(struct v4l2_loopback_device *dev, u32 bytes_used,
@@ -1372,7 +1374,7 @@ static int v4l2loopback_set_ctrl(struct v4l2_loopback_device *dev, u32 id,
 		if (result < 0)
 			return result;
 		if (!dev->keep_format) {
-			if (has_no_owners(dev) && !any_buffers_mapped(dev))
+			if (has_no_owners(dev) && !any_mapped_buffer(dev))
 				free_buffers(dev);
 		}
 		mutex_unlock(&dev->image_mutex);
@@ -1585,13 +1587,25 @@ static int vidioc_s_input(struct file *file, void *fh, unsigned int index)
 		flags |= V4L2_BUF_FLAG_DONE;    \
 	} while (0)
 
-static bool any_buffers_mapped(struct v4l2_loopback_device *dev)
+static bool any_mapped_buffer(struct v4l2_loopback_device *dev)
 {
 	u32 index;
 	for (index = 0; index < dev->buffer_count; ++index)
 		if (dev->buffers[index].buffer.flags & V4L2_BUF_FLAG_MAPPED)
 			return true;
 	return false;
+}
+
+static void get_buffer(struct v4l2l_buffer *buf)
+{
+	if (atomic_inc_return(&buf->use_count))
+		buf->buffer.flags |= V4L2_BUF_FLAG_MAPPED;
+}
+
+static void put_buffer(struct v4l2l_buffer *buf)
+{
+	if (atomic_dec_and_test(&buf->use_count))
+		buf->buffer.flags &= ~V4L2_BUF_FLAG_MAPPED;
 }
 
 static void prepare_buffer_queue(struct v4l2_loopback_device *dev, int count)
@@ -1722,7 +1736,7 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 	if (has_other_owners(opener, dev) && dev->used_buffer_count > 0) {
 		/* allow 'allocation' of existing number of buffers */
 		req_count = dev->used_buffer_count;
-	} else if (any_buffers_mapped(dev)) {
+	} else if (any_mapped_buffer(dev)) {
 		/* do not allow re-allocation if buffers are mapped */
 		result = -EBUSY;
 		goto exit_reqbufs_unlock;
@@ -2181,22 +2195,16 @@ static int vidioc_subscribe_event(struct v4l2_fh *fh,
 /* file operations */
 static void vm_open(struct vm_area_struct *vma)
 {
-	struct v4l2l_buffer *buf;
+	struct v4l2l_buffer *buf = vma->vm_private_data;
 	MARK();
-
-	buf = vma->vm_private_data;
-	atomic_inc(&buf->use_count);
-	buf->buffer.flags |= V4L2_BUF_FLAG_MAPPED;
+	get_buffer(buf);
 }
 
 static void vm_close(struct vm_area_struct *vma)
 {
-	struct v4l2l_buffer *buf;
+	struct v4l2l_buffer *buf = vma->vm_private_data;
 	MARK();
-
-	buf = vma->vm_private_data;
-	if (atomic_dec_and_test(&buf->use_count))
-		buf->buffer.flags &= ~V4L2_BUF_FLAG_MAPPED;
+	put_buffer(buf);
 }
 
 static struct vm_operations_struct vm_ops = {
@@ -2273,8 +2281,8 @@ static int v4l2_loopback_mmap(struct file *file, struct vm_area_struct *vma)
 
 	vma->vm_ops = &vm_ops;
 	vma->vm_private_data = buffer;
+	get_buffer(buffer);
 
-	vm_open(vma);
 exit_mmap_unlock:
 	mutex_unlock(&dev->image_mutex);
 	return result;
@@ -2507,7 +2515,7 @@ static void free_buffers(struct v4l2_loopback_device *dev)
 	dprintk("free_buffers() with image@%p\n", dev->image);
 	if (!dev->image)
 		return;
-	if (!has_no_owners(dev) || any_buffers_mapped(dev))
+	if (!has_no_owners(dev) || any_mapped_buffer(dev))
 		/* maybe an opener snuck in before image_mutex was acquired */
 		printk(KERN_WARNING
 		       "v4l2-loopback free_buffers() buffers of video device "
@@ -2557,7 +2565,7 @@ static int allocate_buffers(struct v4l2_loopback_device *dev,
 		image_size, buffer_size, dev->buffer_count);
 	if (dev->image) {
 		/* check that no buffers are expected in user-space */
-		if (!has_no_owners(dev) || any_buffers_mapped(dev))
+		if (!has_no_owners(dev) || any_mapped_buffer(dev))
 			return -EBUSY;
 		dprintk("allocate_buffers() existing size=%lubytes\n",
 			dev->image_size);
