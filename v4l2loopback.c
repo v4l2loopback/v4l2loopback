@@ -1824,17 +1824,24 @@ static void buffer_written(struct v4l2_loopback_device *dev,
 	timer_delete_sync(&dev->sustain_timer);
 	timer_delete_sync(&dev->timeout_timer);
 
-	spin_lock_bh(&dev->list_lock);
-	list_move_tail(&buf->list_head, &dev->outbufs_list);
-	spin_unlock_bh(&dev->list_lock);
+	mutex_lock(&dev->image_mutex);
+	if (dev->used_buffer_count != 0) {
+		spin_lock_bh(&dev->list_lock);
+		list_move_tail(&buf->list_head, &dev->outbufs_list);
+		spin_unlock_bh(&dev->list_lock);
+
+		spin_lock_bh(&dev->lock);
+		dev->bufpos2index[v4l2l_mod64(dev->write_position,
+					      dev->used_buffer_count)] =
+			buf->buffer.index;
+
+		++dev->write_position;
+		dev->reread_count = 0;
+		spin_unlock_bh(&dev->lock);
+	}
+	mutex_unlock(&dev->image_mutex);
 
 	spin_lock_bh(&dev->lock);
-	dev->bufpos2index[v4l2l_mod64(dev->write_position,
-				      dev->used_buffer_count)] =
-		buf->buffer.index;
-	++dev->write_position;
-	dev->reread_count = 0;
-
 	check_timers(dev);
 	spin_unlock_bh(&dev->lock);
 }
@@ -1948,6 +1955,11 @@ static int get_capture_buffer(struct file *file)
 		return -EAGAIN;
 	wait_event_interruptible(dev->read_event, can_read(dev, opener));
 
+	mutex_lock(&dev->image_mutex);
+	if (!dev->image || dev->used_buffer_count == 0) {
+		mutex_unlock(&dev->image_mutex);
+		return -EINVAL;
+	}
 	spin_lock_bh(&dev->lock);
 	if (dev->write_position == opener->read_position) {
 		if (dev->reread_count > opener->reread_count + 2)
@@ -1967,21 +1979,20 @@ static int get_capture_buffer(struct file *file)
 	}
 	timeout_happened = dev->timeout_happened && (dev->timeout_jiffies > 0);
 	dev->timeout_happened = 0;
-	spin_unlock_bh(&dev->lock);
-
 	index = dev->bufpos2index[pos];
+	if (timeout_happened)
+		get_buffer(&dev->buffers[index]);
+
+	spin_unlock_bh(&dev->lock);
+	mutex_unlock(&dev->image_mutex);
+
 	if (timeout_happened) {
-		if (index >= dev->used_buffer_count) {
-			dprintkrw("get_capture_buffer() read position is at "
-				  "an unallocated buffer [index=%u]\n",
-				  index);
-			return -EFAULT;
-		}
 		/* although allocated on-demand, timeout_image is freed only
 		 * in free_buffers(), so we don't need to worry about it being
 		 * deallocated suddenly */
 		memcpy(dev->image + dev->buffers[index].buffer.m.offset,
 		       dev->timeout_image, dev->buffer_size);
+		put_buffer(&dev->buffers[index]);
 	}
 	return (int)index;
 }
@@ -2462,14 +2473,26 @@ static ssize_t v4l2_loopback_read(struct file *file, char __user *buf,
 	index = get_capture_buffer(file);
 	if (index < 0)
 		return index;
+
+	mutex_lock(&dev->image_mutex);
+	if (!dev->image) {
+		mutex_unlock(&dev->image_mutex);
+		return -EINVAL;
+	}
+	get_buffer(&dev->buffers[index]);
+	mutex_unlock(&dev->image_mutex);
+
 	b = &dev->buffers[index].buffer;
 	if (count > b->bytesused)
 		count = b->bytesused;
+
 	if (copy_to_user((void *)buf, (void *)(dev->image + b->m.offset),
 			 count)) {
 		printk(KERN_ERR "v4l2-loopback read() failed copy_to_user()\n");
+		put_buffer(&dev->buffers[index]);
 		return -EFAULT;
 	}
+	put_buffer(&dev->buffers[index]);
 	return count;
 }
 
@@ -2488,15 +2511,25 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
 
 	if (count > dev->buffer_size)
 		count = dev->buffer_size;
-	index = v4l2l_mod64(dev->write_position, dev->used_buffer_count);
-	b = &dev->buffers[index].buffer;
 
+	mutex_lock(&dev->image_mutex);
+	if (!dev->image || dev->used_buffer_count == 0) {
+		mutex_unlock(&dev->image_mutex);
+		return -EINVAL;
+	}
+	index = v4l2l_mod64(dev->write_position, dev->used_buffer_count);
+	get_buffer(&dev->buffers[index]);
+	mutex_unlock(&dev->image_mutex);
+
+	b = &dev->buffers[index].buffer;
 	if (copy_from_user((void *)(dev->image + b->m.offset), (void *)buf,
 			   count)) {
 		printk(KERN_ERR
 		       "v4l2-loopback write() failed copy_from_user()\n");
+		put_buffer(&dev->buffers[index]);
 		return -EFAULT;
 	}
+	put_buffer(&dev->buffers[index]);
 	b->bytesused = count;
 
 	v4l2l_get_timestamp(b);
