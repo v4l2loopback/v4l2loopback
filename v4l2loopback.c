@@ -382,6 +382,7 @@ struct v4l2_loopback_device {
 	spinlock_t lock; /* lock for the timeout and framerate timers */
 	spinlock_t list_lock; /* lock for the OUTPUT buffer queue */
 	wait_queue_head_t read_event;
+	wait_queue_head_t output_event; /* waitqueue for OUTPUT DQBUF blocking */
 	u32 format_tokens; /* tokens to 'set format' for OUTPUT, CAPTURE, or
 			    * timeout buffers */
 	u32 stream_tokens; /* tokens to 'start' OUTPUT, CAPTURE, or timeout
@@ -1615,30 +1616,21 @@ static void prepare_buffer_queue(struct v4l2_loopback_device *dev, int count)
 
 	spin_lock_bh(&dev->list_lock);
 
-	/* ensure sufficient number of buffers in queue */
+	/* Remove all buffers from the output queue - they will be added
+	 * when queued via VIDIOC_QBUF */
+	list_for_each_entry_safe(bufd, n, &dev->outbufs_list, list_head) {
+		list_del_init(&bufd->list_head);
+	}
+
+	/* Preserve the existing bufpos2index mapping so that capture readers
+	 * can still reference the last written frames after the output queue
+	 * has been cleared (e.g. via sustain_framerate or timeout mechanism).
+	 * Only clear the buffer flags. */
 	for (pos = 0; pos < count; ++pos) {
 		bufd = &dev->buffers[pos];
-		if (list_empty(&bufd->list_head))
-			list_add_tail(&bufd->list_head, &dev->outbufs_list);
-	}
-	if (list_empty(&dev->outbufs_list))
-		goto exit_prepare_queue_unlock;
-
-	/* remove any excess buffers */
-	list_for_each_entry_safe(bufd, n, &dev->outbufs_list, list_head) {
-		if (bufd->buffer.index >= count)
-			list_del_init(&bufd->list_head);
-	}
-
-	/* buffers are no longer queued; and `write_position` will correspond
-	 * to the first item of `outbufs_list`. */
-	pos = v4l2l_mod64(dev->write_position, count);
-	list_for_each_entry(bufd, &dev->outbufs_list, list_head) {
 		unset_flags(bufd->buffer.flags);
-		dev->bufpos2index[pos % count] = bufd->buffer.index;
-		++pos;
 	}
-exit_prepare_queue_unlock:
+
 	spin_unlock_bh(&dev->list_lock);
 }
 
@@ -1918,6 +1910,7 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 		buffer_written(dev, bufd);
 		set_done(bufd->buffer.flags);
 		wake_up_all(&dev->read_event);
+		wake_up_all(&dev->output_event);
 		break;
 	default:
 		return -EINVAL;
@@ -1936,6 +1929,27 @@ static int can_read(struct v4l2_loopback_device *dev,
 	ret = dev->write_position > opener->read_position ||
 	      dev->reread_count > opener->reread_count || dev->timeout_happened;
 	spin_unlock_bh(&dev->lock);
+	return ret;
+}
+
+/* check whether an OUTPUT DQBUF waiter should unblock.
+ * Returns true if:
+ *   - the output stream has been stopped (STREAMOFF released the token),
+ *     so the waiter must return immediately with an error, OR
+ *   - there is at least one buffer in the output queue ready to dequeue.
+ * The stream-stopped check is first: STREAMOFF must always unblock waiters.
+ */
+static int can_dq_output(struct v4l2_loopback_device *dev,
+			 struct v4l2_loopback_opener *opener)
+{
+	int ret;
+
+	if (!(opener->stream_token & V4L2L_TOKEN_OUTPUT))
+		return 1;
+
+	spin_lock_bh(&dev->list_lock);
+	ret = !list_empty(&dev->outbufs_list);
+	spin_unlock_bh(&dev->list_lock);
 	return ret;
 }
 
@@ -2028,16 +2042,39 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 		unset_flags(buf->flags);
 		break;
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
-		spin_lock_bh(&dev->list_lock);
-
-		bufd = list_first_entry_or_null(&dev->outbufs_list,
-						struct v4l2l_buffer, list_head);
-		if (bufd)
-			list_move_tail(&bufd->list_head, &dev->outbufs_list);
-
-		spin_unlock_bh(&dev->list_lock);
-		if (!bufd)
-			return -EFAULT;
+		/*
+		 * V4L2 spec (VIDIOC_DQBUF): "By default VIDIOC_DQBUF blocks
+		 * when no buffer is in the outgoing queue. When the O_NONBLOCK
+		 * flag was given to open(), VIDIOC_DQBUF returns immediately
+		 * with an EAGAIN error code when no buffer is available."
+		 * Ref: https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/vidioc-qbuf.html
+		 *
+		 * Loop to handle spurious wakeups and races where another
+		 * caller dequeues the buffer between our wakeup and lock.
+		 */
+		for (;;) {
+			spin_lock_bh(&dev->list_lock);
+			bufd = list_first_entry_or_null(&dev->outbufs_list,
+							struct v4l2l_buffer, list_head);
+			if (bufd)
+				list_del_init(&bufd->list_head);
+			spin_unlock_bh(&dev->list_lock);
+			if (bufd)
+				break;
+			if (file->f_flags & O_NONBLOCK)
+				return -EAGAIN;
+			if (wait_event_interruptible(dev->output_event,
+						     can_dq_output(dev, opener)))
+				return -ERESTARTSYS;
+			/*
+			 * If woken because STREAMOFF released the stream
+			 * token, return -EAGAIN per V4L2 spec: STREAMOFF
+			 * implicitly dequeues all buffers and must unblock
+			 * pending DQBUF calls.
+			 */
+			if (!(opener->stream_token & V4L2L_TOKEN_OUTPUT))
+				return -EAGAIN;
+		}
 		unset_flags(bufd->buffer.flags);
 		*buf = bufd->buffer;
 		break;
@@ -2117,6 +2154,13 @@ static int vidioc_streamoff(struct file *file, void *fh,
 		/* reset output queue */
 		if (dev->used_buffer_count > 0)
 			prepare_buffer_queue(dev, dev->used_buffer_count);
+		/*
+		 * Wake threads blocked in OUTPUT DQBUF.  After STREAMOFF
+		 * opener->stream_token is 0, so can_dq_output() returns
+		 * true and vidioc_dqbuf() will return -EAGAIN.
+		 * V4L2 spec: STREAMOFF must notify all pending operations.
+		 */
+		wake_up_all(&dev->output_event);
 		return 0;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
 		if (opener->stream_token & token) {
@@ -2947,6 +2991,7 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	spin_lock_init(&dev->lock);
 	spin_lock_init(&dev->list_lock);
 	init_waitqueue_head(&dev->read_event);
+	init_waitqueue_head(&dev->output_event);
 	dev->format_tokens = V4L2L_TOKEN_MASK;
 	dev->stream_tokens = V4L2L_TOKEN_MASK;
 
