@@ -339,6 +339,7 @@ struct v4l2l_buffer {
 	struct v4l2_buffer buffer;
 	struct list_head list_head;
 	atomic_t use_count;
+	struct dma_buf *import_dbuf;
 };
 
 struct v4l2_loopback_device {
@@ -1653,8 +1654,8 @@ exit_prepare_queue_unlock:
 }
 
 /* forward declaration */
-static int vidioc_streamoff(struct file *file, void *fh,
-			    enum v4l2_buf_type type);
+static int do_streamoff(struct file *file, void *fh, enum v4l2_buf_type type);
+static void release_import_dbufs_locked(struct v4l2_loopback_device *dev);
 /* negotiate buffer type
  * only mmap streaming supported
  * called on VIDIOC_REQBUFS
@@ -1689,6 +1690,18 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 		reqbuf->flags = 0; /* no memory consistency support */
 #endif
 		break;
+	case V4L2_MEMORY_DMABUF:
+		/*
+		 * Zero-copy injection, only on the OUTPUT (producer) queue. The
+		 * buffer slots still come from the normal allocation. QBUF
+		 * imports a producer dma-buf into the slot instead of copying.
+		 */
+		if (reqbuf->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
+			return -EINVAL;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)
+		reqbuf->capabilities = V4L2_BUF_CAP_SUPPORTS_DMABUF;
+#endif
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -1718,7 +1731,13 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 			acquire_token(dev, opener, format, token);
 			opener->io_method = V4L2L_IO_MMAP;
 		}
-		result = vidioc_streamoff(file, fh, reqbuf->type);
+		result = do_streamoff(file, fh, reqbuf->type);
+		/*
+		 * Release imports here while image_mutex is held. do_streamoff()
+		 * cannot, and this also covers close() via REQBUFS(0).
+		 */
+		if (reqbuf->type == V4L2_BUF_TYPE_VIDEO_OUTPUT)
+			release_import_dbufs_locked(dev);
 		opener->buffer_count = 0;
 		/* undocumented requirement - REQBUFS with count zero should
 		 * ALSO release lock on logical stream */
@@ -1867,6 +1886,7 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	struct v4l2l_buffer *bufd;
 	u32 index = buf->index;
 	u32 type = buf->type;
+	u32 memory = buf->memory;
 
 	if (!is_allocated(opener, type, index))
 		return -EINVAL;
@@ -1876,6 +1896,11 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	case V4L2_MEMORY_MMAP:
 		if (!(bufd->buffer.flags & V4L2_BUF_FLAG_MAPPED))
 			dprintkrw("QBUF() unmapped buffer [index=%u]\n", index);
+		break;
+	case V4L2_MEMORY_DMABUF:
+		/* Zero-copy injection: OUTPUT (producer) queue only. */
+		if (type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
+			return -EINVAL;
 		break;
 	default:
 		return -EINVAL;
@@ -1895,6 +1920,49 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
 		dprintkrw("QBUF(OUTPUT, index=%u) -> " BUFFER_DEBUG_FMT_STR,
 			  index, BUFFER_DEBUG_FMT_ARGS(buf));
+		if (buf->memory == V4L2_MEMORY_DMABUF) {
+			/*
+			 * Use the producer's dma-buf as this slot's frame
+			 * instead of copying into dev->image. The ref is
+			 * released when the slot is re-queued or freed.
+			 */
+			struct dma_buf *db = dma_buf_get(buf->m.fd);
+			struct dma_buf *old;
+
+			if (IS_ERR(db)) {
+				dprintkrw("QBUF(OUTPUT) bad dmabuf fd %d\n",
+					  buf->m.fd);
+				return -EINVAL;
+			}
+			/*
+			 * image_mutex serializes import_dbuf against EXPBUF and
+			 * free_buffers(). Put the old ref outside the lock.
+			 */
+			mutex_lock(&dev->image_mutex);
+			if (db->size < dev->buffer_size) {
+				mutex_unlock(&dev->image_mutex);
+				dma_buf_put(db);
+				return -EINVAL;
+			}
+			old = bufd->import_dbuf;
+			bufd->import_dbuf = db;
+			mutex_unlock(&dev->image_mutex);
+			if (old)
+				dma_buf_put(old);
+		} else if (bufd->import_dbuf) {
+			/*
+			 * Filled from dev->image now, so drop any stale import
+			 * or EXPBUF would re-export the old producer frame.
+			 */
+			struct dma_buf *old;
+
+			mutex_lock(&dev->image_mutex);
+			old = bufd->import_dbuf;
+			bufd->import_dbuf = NULL;
+			mutex_unlock(&dev->image_mutex);
+			if (old)
+				dma_buf_put(old);
+		}
 		if (!(bufd->buffer.flags & V4L2_BUF_FLAG_TIMESTAMP_COPY) &&
 		    (buf->timestamp.tv_sec == 0 &&
 		     buf->timestamp.tv_usec == 0)) {
@@ -1935,6 +2003,7 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 		return -EINVAL;
 	}
 	buf->type = type;
+	buf->memory = memory;
 	return 0;
 }
 
@@ -2016,11 +2085,17 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
 	struct v4l2_loopback_opener *opener = v4l2l_f_to_opener(file, fh);
 	u32 type = buf->type;
+	u32 memory = buf->memory;
 	int index;
 	struct v4l2l_buffer *bufd;
 
-	if (buf->memory != V4L2_MEMORY_MMAP)
-		return -EINVAL;
+	if (buf->memory != V4L2_MEMORY_MMAP) {
+		/* Allow the producer to dequeue DMABUF buffers on the OUTPUT
+		 * queue so it can recycle slots after a frame is consumed. */
+		if (!(buf->memory == V4L2_MEMORY_DMABUF &&
+		      type == V4L2_BUF_TYPE_VIDEO_OUTPUT))
+			return -EINVAL;
+	}
 	if (opener->format_token & V4L2L_TOKEN_TIMEOUT) {
 		*buf = dev->timeout_buffer.buffer;
 		buf->type = type;
@@ -2052,16 +2127,35 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 			return -EFAULT;
 		unset_flags(bufd->buffer.flags);
 		*buf = bufd->buffer;
+		index = bufd->buffer.index;
 		break;
 	default:
 		return -EINVAL;
 	}
 
 	buf->type = type;
+	buf->memory = memory;
 	dprintkrw("DQBUF(%s, index=%u) -> " BUFFER_DEBUG_FMT_STR,
 		  V4L2_TYPE_IS_CAPTURE(type) ? "CAPTURE" : "OUTPUT", index,
 		  BUFFER_DEBUG_FMT_ARGS(buf));
 	return 0;
+}
+
+/* Release all imported (DMABUF-OUTPUT) frames still held on buffer slots.
+ * Caller must hold dev->image_mutex (serializes against QBUF/DQBUF/EXPBUF).
+ */
+static void release_import_dbufs_locked(struct v4l2_loopback_device *dev)
+{
+	int i;
+
+	for (i = 0; i < dev->buffer_count; i++) {
+		struct dma_buf *db = dev->buffers[i].import_dbuf;
+
+		if (db) {
+			dev->buffers[i].import_dbuf = NULL;
+			dma_buf_put(db);
+		}
+	}
 }
 
 /* ------------- STREAMING ------------------- */
@@ -2103,8 +2197,7 @@ static int vidioc_streamon(struct file *file, void *fh, enum v4l2_buf_type type)
 /* stop streaming
  * called on VIDIOC_STREAMOFF
  */
-static int vidioc_streamoff(struct file *file, void *fh,
-			    enum v4l2_buf_type type)
+static int do_streamoff(struct file *file, void *fh, enum v4l2_buf_type type)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
 	struct v4l2_loopback_opener *opener = v4l2l_f_to_opener(file, fh);
@@ -2139,6 +2232,25 @@ static int vidioc_streamoff(struct file *file, void *fh,
 	default:
 		return -EINVAL;
 	}
+}
+
+/*
+ * STREAMOFF ioctl entry. Runs do_streamoff() and releases imported OUTPUT
+ * frames (V4L2 unlocks all buffers on STREAMOFF). image_mutex is taken here
+ * since the ioctl path, unlike vidioc_reqbufs(), does not already hold it.
+ */
+static int vidioc_streamoff(struct file *file, void *fh,
+			    enum v4l2_buf_type type)
+{
+	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
+	int ret = do_streamoff(file, fh, type);
+
+	if (!ret && type == V4L2_BUF_TYPE_VIDEO_OUTPUT) {
+		mutex_lock(&dev->image_mutex);
+		release_import_dbufs_locked(dev);
+		mutex_unlock(&dev->image_mutex);
+	}
+	return ret;
 }
 
 #ifdef CONFIG_VIDEO_V4L1_COMPAT
@@ -2401,6 +2513,26 @@ static int vidioc_expbuf(struct file *file, void *fh,
 		ret = -EINVAL;
 		goto unlock;
 	}
+	/*
+	 * If the slot was filled by DMABUF import, hand the consumer that
+	 * same dma-buf (a fresh fd) instead of wrapping dev->image, so the
+	 * producer's pages pass through with no copy.
+	 */
+	if (dev->buffers[eb->index].import_dbuf) {
+		struct dma_buf *db = dev->buffers[eb->index].import_dbuf;
+
+		get_dma_buf(db);
+		fd = dma_buf_fd(db, eb->flags & O_CLOEXEC);
+		if (fd < 0) {
+			dma_buf_put(db);
+			ret = fd;
+			goto unlock;
+		}
+		eb->fd = fd;
+		ret = 0;
+		goto unlock;
+	}
+
 	offset = (unsigned long)eb->index * dev->buffer_size;
 	if (offset + dev->buffer_size > dev->image_size) {
 		ret = -EINVAL;
@@ -2762,6 +2894,8 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
 static void free_buffers(struct v4l2_loopback_device *dev)
 {
 	dprintk("free_buffers() with image@%p\n", dev->image);
+	/* Release any imported (DMABUF-OUTPUT) frames held on buffer slots. */
+	release_import_dbufs_locked(dev);
 	if (!dev->image)
 		return;
 	if (!has_no_owners(dev) || any_mapped_buffer(dev))
