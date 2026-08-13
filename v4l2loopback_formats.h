@@ -5,6 +5,9 @@ static const struct v4l2l_format formats[] = {
 #ifndef V4L2_PIX_FMT_HEVC
 #define V4L2_PIX_FMT_HEVC v4l2_fourcc('H', 'E', 'V', 'C')
 #endif
+#ifndef V4L2_PIX_FMT_AV1
+#define V4L2_PIX_FMT_AV1 v4l2_fourcc('A', 'V', '0', '1')
+#endif
 
 	/* here come the packed formats */
 	{
@@ -450,4 +453,12 @@ static const struct v4l2l_format formats[] = {
 		.flags = FORMAT_FLAGS_COMPRESSED,
 	},
 #endif /* V4L2_PIX_FMT_HEVC */
+#ifdef V4L2_PIX_FMT_AV1
+	{
+		.name = "AV1",
+		.fourcc = V4L2_PIX_FMT_AV1,
+		.depth = 32,
+		.flags = FORMAT_FLAGS_COMPRESSED,
+	},
+#endif /* V4L2_PIX_FMT_AV1 */
 };
