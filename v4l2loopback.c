@@ -892,6 +892,7 @@ static void free_timeout_buffer(struct v4l2_loopback_device *dev);
 static void check_timers(struct v4l2_loopback_device *dev);
 static const struct v4l2_file_operations v4l2_loopback_fops;
 static const struct v4l2_ioctl_ops v4l2_loopback_ioctl_ops;
+static void notify_mode_change(struct v4l2_loopback_device *dev, int mode);
 
 /* V4L2 ioctl caps and params calls */
 /* returns device capabilities
@@ -2062,6 +2063,7 @@ static int vidioc_streamon(struct file *file, void *fh, enum v4l2_buf_type type)
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
 	struct v4l2_loopback_opener *opener = v4l2l_f_to_opener(file, fh);
 	u32 token = token_from_type(type);
+	u32 streamtoken = dev->stream_tokens;
 
 	/* short-circuit when using timeout buffer set */
 	if (opener->format_token & V4L2L_TOKEN_TIMEOUT)
@@ -2082,6 +2084,8 @@ static int vidioc_streamon(struct file *file, void *fh, enum v4l2_buf_type type)
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
 		if (dev->stream_tokens & token)
 			acquire_token(dev, opener, stream, token);
+		if (streamtoken != dev->stream_tokens)
+			notify_mode_change(dev, V4L2_BUF_TYPE_VIDEO_CAPTURE);
 		return 0;
 	default:
 		return -EINVAL;
@@ -2097,6 +2101,7 @@ static int vidioc_streamoff(struct file *file, void *fh,
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
 	struct v4l2_loopback_opener *opener = v4l2l_f_to_opener(file, fh);
 	u32 token = token_from_type(type);
+	u32 streamtoken = dev->stream_tokens;
 
 	/* short-circuit when using timeout buffer set */
 	if (opener->format_token & V4L2L_TOKEN_TIMEOUT)
@@ -2117,6 +2122,8 @@ static int vidioc_streamoff(struct file *file, void *fh,
 		/* reset output queue */
 		if (dev->used_buffer_count > 0)
 			prepare_buffer_queue(dev, dev->used_buffer_count);
+		if (streamtoken != dev->stream_tokens)
+			notify_mode_change(dev, V4L2_BUF_TYPE_VIDEO_OUTPUT);
 		return 0;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
 		if (opener->stream_token & token) {
@@ -2539,6 +2546,23 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
 	wake_up_all(&dev->read_event);
 
 	return count;
+}
+
+/* notify the user when the device is ready for capture (or not)
+ * via udev
+ */
+static void notify_mode_change(struct v4l2_loopback_device *dev, int mode)
+{
+	int ret = 0;
+	char *envdata = (mode == V4L2_BUF_TYPE_VIDEO_CAPTURE) ?
+				"ID_V4L2LOOPBACK_CAPABILITIES=:capture:" :
+				"ID_V4L2LOOPBACK_CAPABILITIES=:video_output:";
+	char *envp[] = { envdata, NULL };
+	ret = kobject_uevent_env(&dev->vdev->dev.kobj, KOBJ_CHANGE, envp);
+
+	if (ret)
+		dev_warn(&dev->vdev->dev,
+			 "failed to emit mode-change uevent: %d\n", ret);
 }
 
 /* init functions */
