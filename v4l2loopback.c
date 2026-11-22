@@ -1045,7 +1045,13 @@ static int vidioc_enum_frameintervals(struct file *file, void *fh,
 		argp->type = V4L2_FRMIVAL_TYPE_CONTINUOUS;
 		argp->stepwise.min.numerator = 1;
 		argp->stepwise.min.denominator = V4L2LOOPBACK_FPS_MAX;
-		argp->stepwise.max.numerator = V4L2LOOPBACK_FRAME_INTERVAL_MAX;
+		/*
+		 * Userspace inverts the interval to derive a framerate, and
+		 * UINT32_MAX overflows to -1 there. That yields a descending
+		 * framerate range, which intersects to empty with any normal
+		 * framerate filter.
+		 */
+		argp->stepwise.max.numerator = __INT_MAX__;
 		argp->stepwise.max.denominator = 1;
 		argp->stepwise.step.numerator = 1;
 		argp->stepwise.step.denominator = 1;
