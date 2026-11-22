@@ -252,9 +252,15 @@ static DEFINE_IDR(v4l2loopback_index_idr);
 static DEFINE_MUTEX(v4l2loopback_ctl_mutex);
 
 /* frame intervals */
+#ifndef V4L2LOOPBACK_FRAME_INTERVAL_MAX
 #define V4L2LOOPBACK_FRAME_INTERVAL_MAX __UINT32_MAX__
+#endif
+#ifndef V4L2LOOPBACK_FPS_DEFAULT
 #define V4L2LOOPBACK_FPS_DEFAULT 30
+#endif
+#ifndef V4L2LOOPBACK_FPS_MAX
 #define V4L2LOOPBACK_FPS_MAX 1000
+#endif
 
 /* control IDs */
 #define V4L2LOOPBACK_CID_BASE (V4L2_CID_USER_BASE | 0xf000)
