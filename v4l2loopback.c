@@ -64,8 +64,8 @@
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
 #define v4l2l_f_to_opener(_file, _fh) fh_to_opener(_fh)
-#define v4l2_fh_add(fh, filp) v4l2_fh_add(fh)
-#define v4l2_fh_del(fh, filp) v4l2_fh_del(fh)
+#define v4l2_fh_add(_fh, _file) v4l2_fh_add(_fh)
+#define v4l2_fh_del(_fh, _file) v4l2_fh_del(_fh)
 #else
 #define v4l2l_f_to_opener(_file, _fh) file_to_opener(_file)
 #endif
